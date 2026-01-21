@@ -1,0 +1,8 @@
+streamlit
+requests
+textblob
+deep-translator
+pandas
+numpy
+pytz
+feedparser
