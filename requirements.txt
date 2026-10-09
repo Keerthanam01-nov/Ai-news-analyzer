@@ -1,8 +1,7 @@
-streamlit
-requests
-textblob
-deep-translator
-pandas
-numpy
-pytz
-feedparser
+streamlit>=1.36
+requests>=2.31
+textblob>=0.18
+deep-translator>=1.11.4
+pandas>=2.0
+pytz>=2024.1
+feedparser>=6.0.11
