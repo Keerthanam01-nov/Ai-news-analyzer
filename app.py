@@ -156,15 +156,19 @@ def credibility_note(source, text):
     return score
 
 def _translate_chunk_google(chunk, target):
-    return GoogleTranslator(source="auto", target=target).translate(chunk)
+    # Small chunks are more reliable with public translation endpoints.
+    result = GoogleTranslator(source="auto", target=target).translate(chunk)
+    if not result or not str(result).strip():
+        raise RuntimeError("Google Translate returned an empty result")
+    return str(result).strip()
 
 def _translate_chunk_mymemory(chunk, target):
-    # Independent fallback provider. Public endpoint may impose limits; failures are caught.
+    # Public endpoint has quotas; errors are handled by the retry wrapper below.
     response = requests.get(
         "https://api.mymemory.translated.net/get",
         params={"q": chunk, "langpair": f"en|{target}"},
-        timeout=12,
-        headers={"User-Agent": "ExamWiseIndia/1.0"},
+        timeout=15,
+        headers={"User-Agent": "ExamWiseIndia/1.1"},
     )
     response.raise_for_status()
     payload = response.json()
@@ -173,10 +177,22 @@ def _translate_chunk_mymemory(chunk, target):
     result = (payload.get("responseData") or {}).get("translatedText", "")
     if not result.strip():
         raise RuntimeError("Translation provider returned an empty result")
-    return result
+    return result.strip()
 
+def _translate_with_retry(provider, chunk, target, attempts=2):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return provider(chunk, target)
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.8 * (attempt + 1))
+    raise RuntimeError(f"{type(last_error).__name__}: {last_error}")
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def translate_text(text, language):
-    """Translate short chunks with two provider attempts; always retain the source summary as fallback."""
+    """Translate in short chunks, retry providers, and cache successful results for 24 hours."""
     text = clean_text(text)
     if not text:
         return None, "There is no summary text to translate."
@@ -202,8 +218,8 @@ def translate_text(text, language):
         try:
             translated_chunks = []
             for chunk in chunks:
-                translated_chunks.append(provider(chunk, target))
-                time.sleep(0.15)
+                translated_chunks.append(_translate_with_retry(provider, chunk, target, attempts=2))
+                time.sleep(0.25)
             result = " ".join(x for x in translated_chunks if x).strip()
             if result:
                 return result, None
@@ -211,7 +227,7 @@ def translate_text(text, language):
         except Exception as exc:
             errors.append(f"{provider_name}: {type(exc).__name__}")
             print(f"Translation provider {provider_name} failed for {language}: {type(exc).__name__}: {exc}")
-    return None, "Both free translation providers are temporarily unavailable or rate-limited. Your original summary remains available. Please retry later."
+    return None, "Translation is temporarily unavailable after retries. Your original summary is still available. Try again later; repeated requests may be rate-limited by the free providers."
 
 def extract_article_text(url):
     """Best-effort extraction from a public article page; paywalls and anti-bot pages may block it."""
