@@ -17,7 +17,7 @@
 5. Open Streamlit Community Cloud, wait for the app to rebuild, and check **Manage app → Logs** if deployment fails.
 
 ## Dependencies
-`requirements.txt` is included. Make sure Streamlit Cloud installs the updated requirements during redeploy.
+`requirements.txt` includes `pypdf` for text-based PDF question papers and `beautifulsoup4` for best-effort article extraction. Commit the updated requirements file and wait for Streamlit Cloud to finish reinstalling dependencies.
 
 ## Optional NewsAPI configuration
 RSS fallback works without a key, but feed coverage and uptime vary. To configure NewsAPI, open Streamlit Cloud → app settings → **Secrets** and add:
@@ -29,7 +29,7 @@ NEWSAPI_KEY = ""638626e0c8e24c2c8b074ddea1768e4d""
 Do not commit API keys to GitHub.
 
 ## Translation limitation
-Translation uses two free third-party services with retries/fallback. Neither provides a guaranteed uptime or unlimited rate. If both are blocked or rate-limited, the app preserves the original English summary and displays a message. For production-grade translation, configure a supported paid translation provider.
+Translation uses Google Translate and MyMemory with retries and caches successful translations for 24 hours. Both are public services and can still be blocked or rate-limited; the app then preserves the original summary. For dependable high-volume use, configure a supported translation API with your own credentials.
 
 ## Previous-year question papers (PYQs)
 Upload official text-based PDF/TXT/CSV papers in **PYQ & Mock Lab**. The app can extract/search text and track completion. Scanned/image PDFs require OCR. The built-in sample MCQs are practice questions and must not be labelled as official PYQs. Always verify exam year, paper and answer keys against official releases.
