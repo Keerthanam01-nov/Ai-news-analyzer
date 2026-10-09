@@ -21,7 +21,7 @@ streamlit run app.py
 Open your app settings in Streamlit Cloud.
 Go to Settings > Secrets and add:
 
-NEWSAPI_KEY = "YOUR_ACTUAL_API_KEY"
+NEWSAPI_KEY = ""638626e0c8e24c2c8b074ddea1768e4d""
 
 Never publish your actual API key in a public repository.
 
