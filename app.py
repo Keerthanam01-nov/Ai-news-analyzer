@@ -434,25 +434,31 @@ def _api_error(r):
     return RuntimeError(f"HTTP {r.status_code}: {str(msg)[:140]}")
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def gemini_model():
-    """Pick a fast, working Gemini model automatically (model names change over time)."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def gemini_models():
+    """Ordered list of Gemini models to try. Model names are retired often, so we never rely on one name."""
     if cfg("GEMINI_MODEL"):
-        return cfg("GEMINI_MODEL")
+        return [m.strip() for m in cfg("GEMINI_MODEL").split(",") if m.strip()]
+    found = []
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                          headers={"x-goog-api-key": cfg("GEMINI_API_KEY")}, params={"pageSize": 200}, timeout=8)
         r.raise_for_status()
         names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
+        bad = ("tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma",
+               "exp", "thinking", "preview", "vision", "customtools")
+        flash = [n for n in names if "flash" in n and not any(b_ in n for b_ in bad)]
+
+        def ver(n):
+            m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+            return (float(m.group(1)) if m else 0, "lite" not in n)
+        found = sorted(flash, key=ver, reverse=True)
     except Exception:
-        return "gemini-2.5-flash"
-    for p in ("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"):
-        if p in names:
-            return p
-    bad = ("lite", "tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma", "exp", "thinking")
-    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
-    return sorted(flash)[-1] if flash else (names[0] if names else "gemini-2.5-flash")
+        pass
+    out = ["gemini-flash-latest"]  # Google's always-current alias comes first
+    out += [n for n in found if n not in out][:4]
+    return out
 
 
 def _gemini_once(model, system, msgs, max_tokens, attempts):
@@ -498,17 +504,13 @@ def _call_llm(system, msgs, max_tokens):
         if not r.ok:
             raise _api_error(r)
         return "".join(b.get("text", "") for b in r.json().get("content", []))
-    primary = gemini_model()
-    try:
-        return _gemini_once(primary, system, msgs, max_tokens, 2)
-    except Exception as first:
-        backup = "gemini-2.5-flash-lite"
-        if cfg("GEMINI_MODEL") or primary == backup:
-            raise first
-        try:  # second chance with a lighter, faster model
-            return _gemini_once(backup, system, msgs, max_tokens, 1)
-        except Exception:
-            raise first
+    last = None
+    for i, model in enumerate(gemini_models()[:4]):
+        try:
+            return _gemini_once(model, system, msgs, max_tokens, 2 if i == 0 else 1)
+        except Exception as e:  # retired model (404), blocked, busy... try the next one
+            last = last or e
+    raise last or RuntimeError("No Gemini model available")
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
@@ -1540,7 +1542,7 @@ def mission_card():
 
 
 def contact_email():
-    return cfg("CONTACT_EMAIL") or next(iter(sorted(admin_emails())), "")
+    return cfg("CONTACT_EMAIL", "factdive28@gmail.com")
 
 
 def footer():
