@@ -316,26 +316,47 @@ SYSTEM_BASE = (
 )
 
 
+def ai_enabled():
+    return bool(cfg("ANTHROPIC_API_KEY") or cfg("GEMINI_API_KEY"))
+
+
+def ai_on():
+    return bool(cfg("ANTHROPIC_API_KEY") or cfg("GEMINI_API_KEY"))
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
 def _llm_cached(system, messages_json, max_tokens):
-    key = cfg("ANTHROPIC_API_KEY")
+    msgs = json.loads(messages_json)
+    if cfg("ANTHROPIC_API_KEY"):
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": cfg("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": cfg("ANTHROPIC_MODEL", "claude-haiku-5-5"), "max_tokens": max_tokens,
+                  "system": system, "messages": msgs}, timeout=45)
+        r.raise_for_status()
+        return "".join(b.get("text", "") for b in r.json().get("content", []))
+    model = cfg("GEMINI_MODEL", "gemini-2.0-flash")
     r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={"model": cfg("ANTHROPIC_MODEL", "claude-haiku-5-5"), "max_tokens": max_tokens,
-              "system": system, "messages": json.loads(messages_json)}, timeout=45)
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"},
+        json={"systemInstruction": {"parts": [{"text": system}]},
+              "contents": [{"role": "user" if m["role"] == "user" else "model",
+                            "parts": [{"text": m["content"]}]} for m in msgs],
+              "generationConfig": {"maxOutputTokens": max_tokens}}, timeout=45)
     r.raise_for_status()
-    return "".join(b.get("text", "") for b in r.json().get("content", []))
+    return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
 
 
 def llm(system, messages, max_tokens=700):
     """Returns text, or None when AI is off / limit reached / call failed."""
-    if not cfg("ANTHROPIC_API_KEY") or not ai_allowed():
+    if not ai_on() or not ai_allowed():
         return None
     log("ai")
     try:
         return _llm_cached(system, json.dumps(messages), max_tokens).strip()
-    except Exception:
+    except Exception as e:
+        st.session_state.ai_err = type(e).__name__
         return None
 
 
@@ -581,19 +602,43 @@ def _chunks(text, size=4000):
     return parts or [text]
 
 
+def _tr_direct(text, code):
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "auto", "tl": code, "dt": "t", "q": text},
+                     headers=UA, timeout=15)
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
+
+
+LOCALE = {c: loc for c, loc in LANGS.values()}
+
+
 def _tr(text, code):
-    from deep_translator import GoogleTranslator
-    out = []
-    for c in _chunks(text):
-        for attempt in range(3):
-            try:
-                out.append(GoogleTranslator(source="auto", target=code).translate(c))
-                break
-            except Exception:
-                if attempt == 2:
-                    raise
-                time.sleep(0.7 * (attempt + 1))
-    return " ".join(out)
+    """Try Google first, then MyMemory as a backup. Raises only if both fail."""
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
+    errs = []
+    try:
+        out = []
+        for c in _chunks(text, 4000):
+            for attempt in range(3):
+                try:
+                    out.append(GoogleTranslator(source="auto", target=code).translate(c))
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.7 * (attempt + 1))
+        return " ".join(out)
+    except Exception as e:
+        errs.append(f"google:{type(e).__name__}")
+    try:
+        out = [MyMemoryTranslator(source="en-GB", target=LOCALE.get(code, code)).translate(c)
+               for c in _chunks(text, 450)]
+        if all(out):
+            return " ".join(out)
+    except Exception as e:
+        errs.append(f"mymemory:{type(e).__name__}")
+    raise RuntimeError(" / ".join(errs) or "translation failed")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -607,16 +652,18 @@ def translate(text, code):
 def translate_many(texts, code):
     if code == "en":
         return list(texts)
+    errs = []
 
     def one(t):
         try:
             return _tr(t, code)
-        except Exception:
+        except Exception as e:
+            errs.append(str(e))
             return None
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         res = list(ex.map(one, texts))
     if texts and all(r is None for r in res):
-        raise RuntimeError("translation failed")
+        raise RuntimeError(errs[0] if errs else "translation failed")
     return [r if r is not None else t for r, t in zip(res, texts)]
 
 
@@ -625,8 +672,9 @@ def tr_safe(text):
     code = LANGS[st.session_state.lang][0]
     try:
         return translate(text, code)
-    except Exception:
+    except Exception as e:
         st.warning("Translation is busy right now, so this is shown in English. Please try again in a moment.")
+        st.caption(f"Technical detail: {str(e)[:160]}")
         return text
 
 
@@ -687,7 +735,7 @@ def explain_simply(a):
         f"'Why it matters:'. Do not use bullet points.\nTitle: {a['title']}\nText: {article_text(a)}"}], 450)
     if out:
         return out
-    return short_summary(a, 260) + "\n\n(Tip: add an AI key in settings to get a child-friendly explanation here.)"
+    return short_summary(a, 260) + "\n\n(Tip: add a free GEMINI_API_KEY in Secrets to get a child-friendly explanation here.)"
 
 
 def cartoon_script(a):
@@ -708,48 +756,118 @@ def cartoon_script(a):
                 return panels, True
         except Exception:
             pass
-    sents = [s for s in re.split(r"(?<=[.!?])\s+", a["text"]) if len(s) > 15][:3]
+    sents = [t for t in re.split(r"(?<=[.!?])\s+", a["text"]) if len(t) > 15][:3]
     em = guess_emoji(a["title"] + " " + a["text"])
-    base = [("Newsie", em, f"Big news today! {a['title']}")]
-    for i, s in enumerate(sents[:2]):
-        base.append(("Kiki" if i == 0 else "Newsie", em, s[:180]))
-    base.append(("Kiki", "🤔", "Wow! I want to read more about this. Where can I check the full story?"))
-    return [{"speaker": s, "emoji": e, "text": t} for s, e, t in base[:4]], False
+    fact = sents[0][:200] if sents else a["title"]
+    more = sents[1][:170] if len(sents) > 1 else "Wow! I want to read the full story. Where can I check it?"
+    base = [("Newsie", em, f"Hello friends! Today's news: {a['title'][:150]}"),
+            ("Kiki", "🤔", "Ooh! Tell me more, Newsie. What happened?"),
+            ("Newsie", em, fact), ("Kiki", "😮", more)]
+    return [{"speaker": sp, "emoji": e, "text": t} for sp, e, t in base], False
+
+
+CARTOON_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}html,body{margin:0;font-family:Nunito,system-ui,sans-serif;color:#1c1650;background:transparent}
+.stage{background:linear-gradient(180deg,#7fd6ff 0%,#c9f0ff 55%,#9be08f 55%,#6cc56a 100%);border:4px solid #1c1650;border-radius:22px;
+ box-shadow:6px 6px 0 #1c1650;padding:12px 12px 14px;position:relative;overflow:hidden}
+.title{font:800 15px 'Baloo 2';color:#1c1650;background:#FFC93C;display:inline-block;padding:3px 12px;border-radius:99px;max-width:100%;
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scene{font-size:64px;text-align:center;height:84px;line-height:84px;margin-top:4px}
+.scene.pop{animation:pop .5s ease-out}
+.chars{display:flex;justify-content:center;gap:18px;align-items:flex-end;min-height:150px}
+.char{width:118px;opacity:.55;transform:scale(.82);transform-origin:bottom center;transition:transform .3s,opacity .3s}
+.char.active{opacity:1;transform:scale(1.08)}
+.char svg{width:100%;height:auto;display:block;overflow:visible}
+.eyes{animation:blink 4.2s infinite;transform-box:fill-box;transform-origin:center}
+.char.active.talk .beak,.char.active.talk .mouth{animation:chomp .24s infinite}
+.beak,.mouth{transform-box:fill-box;transform-origin:50% 0}
+.char.active.talk{animation:bob .5s ease-in-out infinite}
+.char.active.talk .wl{animation:flapl .5s ease-in-out infinite}.char.active.talk .wr{animation:flapr .5s ease-in-out infinite}
+.wl,.wr{transform-box:fill-box}.wl{transform-origin:100% 20%}.wr{transform-origin:0% 20%}
+.bubble{background:#fff;border:4px solid #1c1650;border-radius:18px;padding:10px 14px;margin-top:10px;min-height:86px;font-weight:800;font-size:16px;line-height:1.4;position:relative}
+.bubble:before{content:"";position:absolute;top:-14px;left:50%;margin-left:-12px;border:12px solid transparent;border-bottom-color:#1c1650;border-top:0}
+.bubble b{display:block;font:800 13px 'Baloo 2';color:#7a3cff}
+.dots{display:flex;gap:6px;justify-content:center;margin:10px 0 2px}.dots i{width:10px;height:10px;border-radius:50%;background:#fff;border:2px solid #1c1650}.dots i.on{background:#FF6B6B}
+.ctl{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:8px}
+button{font:800 16px Nunito;background:#FFC93C;color:#1c1650;border:3px solid #1c1650;border-radius:14px;padding:10px 18px;min-height:46px;cursor:pointer;box-shadow:0 4px 0 #1c1650}
+button:active{transform:translateY(3px);box-shadow:none}button:focus-visible{outline:3px solid #fff;outline-offset:2px}
+.hint{font-size:12px;color:#1c1650;text-align:center;margin-top:8px;opacity:.8}
+@keyframes blink{0%,94%,100%{transform:scaleY(1)}97%{transform:scaleY(.08)}}
+@keyframes chomp{50%{transform:scaleY(1.7)}}
+@keyframes bob{50%{translate:0 -6px}}
+@keyframes flapl{50%{transform:rotate(-24deg)}}@keyframes flapr{50%{transform:rotate(24deg)}}
+@keyframes pop{0%{transform:scale(.3) rotate(-12deg);opacity:0}70%{transform:scale(1.15)}100%{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style></head><body>
+<div class="stage" id="stage">
+ <span class="title">__TITLE__</span>
+ <div class="scene" id="scene">📰</div>
+ <div class="chars">
+  <div class="char active" id="Newsie" aria-label="Newsie the owl">
+   <svg viewBox="0 0 120 140"><g class="wl"><ellipse cx="14" cy="92" rx="13" ry="32" fill="#6D3FD1"/></g><g class="wr"><ellipse cx="106" cy="92" rx="13" ry="32" fill="#6D3FD1"/></g>
+    <ellipse cx="60" cy="88" rx="42" ry="48" fill="#8B5CF6"/><ellipse cx="60" cy="102" rx="27" ry="30" fill="#EDE4FF"/>
+    <path d="M24 52 L30 20 L50 40Z" fill="#6D3FD1"/><path d="M96 52 L90 20 L70 40Z" fill="#6D3FD1"/>
+    <g class="eyes"><circle cx="43" cy="63" r="19" fill="#fff" stroke="#1c1650" stroke-width="3"/><circle cx="77" cy="63" r="19" fill="#fff" stroke="#1c1650" stroke-width="3"/>
+     <circle cx="45" cy="65" r="8" fill="#1c1650"/><circle cx="75" cy="65" r="8" fill="#1c1650"/><circle cx="48" cy="62" r="3" fill="#fff"/><circle cx="78" cy="62" r="3" fill="#fff"/></g>
+    <g class="beak"><path d="M51 78 L69 78 L60 98Z" fill="#FFB020" stroke="#1c1650" stroke-width="2.5" stroke-linejoin="round"/></g>
+    <path d="M45 134 l-5 8 M52 134 l-2 9 M68 134 l2 9 M75 134 l5 8" stroke="#FFB020" stroke-width="4" stroke-linecap="round"/>
+    <rect x="30" y="2" width="60" height="14" rx="4" fill="#1c1650"/><rect x="54" y="-4" width="12" height="8" fill="#1c1650"/></svg></div>
+  <div class="char" id="Kiki" aria-label="Kiki the tiger cub">
+   <svg viewBox="0 0 120 140"><ellipse cx="60" cy="118" rx="34" ry="28" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/><ellipse cx="60" cy="126" rx="20" ry="18" fill="#FFE3BF"/>
+    <circle cx="28" cy="38" r="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/><circle cx="92" cy="38" r="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/>
+    <circle cx="28" cy="38" r="7" fill="#FFB3C1"/><circle cx="92" cy="38" r="7" fill="#FFB3C1"/>
+    <circle cx="60" cy="68" r="44" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/>
+    <path d="M60 25 v14 M44 28 l4 12 M76 28 l-4 12 M18 62 h12 M18 76 h12 M102 62 h-12 M102 76 h-12" stroke="#1c1650" stroke-width="5" stroke-linecap="round"/>
+    <ellipse cx="60" cy="86" rx="22" ry="16" fill="#FFE3BF"/>
+    <g class="eyes"><circle cx="42" cy="62" r="11" fill="#fff" stroke="#1c1650" stroke-width="3"/><circle cx="78" cy="62" r="11" fill="#fff" stroke="#1c1650" stroke-width="3"/>
+     <circle cx="44" cy="64" r="5.5" fill="#1c1650"/><circle cx="76" cy="64" r="5.5" fill="#1c1650"/><circle cx="46" cy="62" r="2" fill="#fff"/><circle cx="78" cy="62" r="2" fill="#fff"/></g>
+    <path d="M52 78 h16 l-8 8z" fill="#FF6B8A" stroke="#1c1650" stroke-width="2" stroke-linejoin="round"/>
+    <g class="mouth"><path d="M48 90 q12 14 24 0 z" fill="#8f1d2c" stroke="#1c1650" stroke-width="2.5" stroke-linejoin="round"/></g></svg></div>
+ </div>
+ <div class="bubble" aria-live="polite"><b id="who"></b><span id="txt"></span></div>
+ <div class="dots" id="dots"></div>
+ <div class="ctl"><button id="play">▶ Play the story</button><button id="next">⏭ Next</button></div>
+ <div class="hint">🔊 Turn your volume up. The voice comes from your phone or laptop, so a language may need its voice installed.</div>
+</div>
+<script>
+(function(){
+const P=__PANELS__,LANG="__LANG__",$=id=>document.getElementById(id);
+const scene=$('scene'),who=$('who'),txt=$('txt'),dots=$('dots'),play=$('play'),next=$('next');
+let idx=0,playing=false,tok=0,typer=null;
+dots.innerHTML=P.map(()=>'<i></i>').join('');
+const synth=window.speechSynthesis;
+function talk(on){['Newsie','Kiki'].forEach(n=>$(n).classList.toggle('talk',on));}
+function show(i,speak){
+ idx=i;const p=P[i],my=++tok;clearInterval(typer);if(synth)synth.cancel();
+ scene.textContent=p.emoji;scene.classList.remove('pop');void scene.offsetWidth;scene.classList.add('pop');
+ who.textContent=p.speaker;txt.textContent='';
+ ['Newsie','Kiki'].forEach(n=>$(n).classList.toggle('active',n===p.speaker));
+ [...dots.children].forEach((d,k)=>d.classList.toggle('on',k===i));
+ let k=0;typer=setInterval(()=>{txt.textContent=p.text.slice(0,++k);if(k>=p.text.length)clearInterval(typer);},speak?32:12);
+ if(!speak){talk(false);return;}
+ talk(true);const fin=()=>{if(my!==tok)return;talk(false);
+  if(playing&&i+1<P.length)setTimeout(()=>{if(my===tok)show(i+1,true)},450);
+  else if(i+1>=P.length){playing=false;play.textContent='🔁 Play again';}};
+ if(synth){const u=new SpeechSynthesisUtterance(p.text);u.lang=LANG;u.rate=.95;u.pitch=p.speaker==='Kiki'?1.45:1.0;
+  u.onend=fin;u.onerror=fin;synth.speak(u);
+  setTimeout(()=>{if(my===tok&&!synth.speaking&&!synth.pending)fin();},1500);}
+ else setTimeout(fin,Math.max(2500,p.text.length*75));
+}
+play.onclick=()=>{playing=true;play.textContent='⏸ Restart';show(0,true);};
+next.onclick=()=>{playing=true;show(Math.min(idx+1,P.length-1),true);};
+show(0,false);
+})();
+</script></body></html>"""
 
 
 def cartoon_html(panels, voice_lang, title):
-    cards = []
-    for i, p in enumerate(panels):
-        who = "🦉" if p["speaker"] == "Newsie" else "🐯"
-        cards.append(
-            f'<div class="panel p{i}" style="animation-delay:{i*0.55}s"><div class="scene">{esc(p["emoji"])}</div>'
-            f'<div class="who">{who}</div><div class="bubble"><b>{esc(p["speaker"])}</b>{esc(p["text"])}</div></div>')
-    speak = json.dumps(" ".join(p["text"] for p in panels)).replace("</", "<\\/")
-    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@600;800&family=Nunito:wght@600;800&display=swap" rel="stylesheet">
-<style>
-*{{box-sizing:border-box}}body{{margin:0;font-family:Nunito,system-ui,sans-serif;color:#1c1650;background:transparent}}
-h3{{font-family:'Baloo 2',sans-serif;color:#F6F4FF;margin:0 0 10px;font-size:18px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}}
-.panel{{background:linear-gradient(160deg,#FFF3C4,#FFD9E0);border:4px solid #1c1650;border-radius:18px;padding:12px;
-position:relative;min-height:230px;display:flex;flex-direction:column;justify-content:space-between;
-box-shadow:6px 6px 0 #1c1650;opacity:0;transform:scale(.92) rotate(-1deg);animation:pop .5s ease-out forwards}}
-.p1{{background:linear-gradient(160deg,#D6F5FF,#E4DBFF)}}.p2{{background:linear-gradient(160deg,#D9FFE9,#FFF3C4)}}.p3{{background:linear-gradient(160deg,#FFE1D6,#FFD9F0)}}
-.scene{{font-size:54px;text-align:center;animation:bob 2.6s ease-in-out infinite}}
-.who{{font-size:36px;position:absolute;right:10px;top:10px;animation:bob 2s ease-in-out infinite .3s}}
-.bubble{{background:#fff;border:3px solid #1c1650;border-radius:16px;padding:9px 12px;font-weight:700;font-size:14.5px;line-height:1.35;position:relative}}
-.bubble b{{display:block;font-family:'Baloo 2';color:#7a3cff;font-size:13px}}
-button{{margin-top:12px;font:800 15px Nunito;background:#FFC93C;color:#1c1650;border:0;border-radius:14px;padding:12px 18px;min-height:44px;cursor:pointer}}
-button:focus-visible{{outline:3px solid #fff;outline-offset:2px}}
-@keyframes pop{{to{{opacity:1;transform:none}}}}@keyframes bob{{50%{{transform:translateY(-6px)}}}}
-@media (prefers-reduced-motion:reduce){{*{{animation:none!important}}.panel{{opacity:1;transform:none}}}}
-</style></head><body>
-<h3>{esc(title[:90])}</h3><div class="grid">{''.join(cards)}</div>
-<button onclick="say()" aria-label="Read the comic aloud">🔊 Read aloud</button>
-<script>
-function say(){{const s=window.speechSynthesis;if(!s){{alert('Read aloud is not supported on this device');return}}
-s.cancel();const u=new SpeechSynthesisUtterance({speak});u.lang="{voice_lang}";u.rate=.92;s.speak(u);}}
-</script></body></html>"""
+    data = json.dumps(
+        [{"speaker": p["speaker"], "emoji": p["emoji"], "text": p["text"]} for p in panels],
+        ensure_ascii=False).replace("</", "<\\/")
+    return (CARTOON_TEMPLATE.replace("__PANELS__", data)
+            .replace("__LANG__", esc(voice_lang)).replace("__TITLE__", esc(title[:80])))
 
 
 def make_quiz(a):
@@ -969,7 +1087,7 @@ def studio(a):
                         p["text"] = translate(p["text"], code)
                 except Exception:
                     st.warning("Translation is busy, so the comic is in English for now.")
-        embed_html(cartoon_html(panels, voice, a["title"]), 620)
+        embed_html(cartoon_html(panels, voice, a["title"]), 600)
         award(10, "cartoon_" + a["url"])
         if not ai:
             st.caption("Quick comic made from the story text. Add an AI key to get richer, funnier comics.")
@@ -1039,8 +1157,9 @@ def page_news():
         with st.spinner("Translating..."):
             try:
                 summaries = translate_many(tuple(summaries), code)
-            except Exception:
+            except Exception as e:
                 st.warning("Translation is busy right now, so summaries are in English. Please try again shortly.")
+                st.caption(f"Technical detail: {str(e)[:160]}")
     cols = st.columns(2) if len(arts) > 1 else [st.container()]
     for i, (a, s) in enumerate(zip(arts, summaries)):
         aid = hashlib.sha1((a["url"] + a["title"]).encode()).hexdigest()[:8]
@@ -1085,7 +1204,7 @@ def newsie_reply(question):
         d = define(word)
         if d:
             return d
-    if not cfg("ANTHROPIC_API_KEY"):
+    if not ai_enabled():
         return keyword_answer(question)
     if not ai_allowed():
         return "You've used all your AI helpers for today. They refresh tomorrow. Meanwhile, try word meanings like *define economy*."
