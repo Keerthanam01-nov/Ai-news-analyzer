@@ -1,9 +1,5 @@
-streamlit>=1.36
+streamlit>=1.50
 requests>=2.31
-textblob>=0.18
-deep-translator>=1.11.4
 pandas>=2.0
-pytz>=2024.1
-feedparser>=6.0.11
-pypdf>=5.0.0
-beautifulsoup4>=4.12.3
+deep-translator>=1.11
+vaderSentiment>=3.3
