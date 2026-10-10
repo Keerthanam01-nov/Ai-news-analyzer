@@ -3,3 +3,5 @@ requests>=2.31
 pandas>=2.0
 deep-translator>=1.11
 vaderSentiment>=3.3
+gTTS>=2.5
+psycopg2-binary>=2.9
