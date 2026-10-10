@@ -55,6 +55,9 @@ APP_NAME = cfg("APP_NAME", "Daily News Buddy")  # change the name any time in Se
 DB_PATH = os.getenv("NEWSVERSE_DB", "data/newsverse.db")
 UA = {"User-Agent": "Mozilla/5.0 (DailyNewsBuddy learning app)"}
 esc = html.escape
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0 Safari/537.36",
+              "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 MAX_STORIES = 50
 
@@ -437,8 +440,7 @@ def _api_error(r):
 @st.cache_data(ttl=3600, show_spinner=False)
 def gemini_models():
     """Ordered list of Gemini models to try. Model names are retired often, so we never rely on one name."""
-    if cfg("GEMINI_MODEL"):
-        return [m.strip() for m in cfg("GEMINI_MODEL").split(",") if m.strip()]
+    pinned = [m.strip() for m in cfg("GEMINI_MODEL").split(",") if m.strip()]
     found = []
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
@@ -456,7 +458,9 @@ def gemini_models():
         found = sorted(flash, key=ver, reverse=True)
     except Exception:
         pass
-    out = ["gemini-flash-latest"]  # Google's always-current alias comes first
+    out = list(pinned)
+    if "gemini-flash-latest" not in out:
+        out.append("gemini-flash-latest")  # Google's always-current alias
     out += [n for n in found if n not in out][:4]
     return out
 
@@ -505,7 +509,7 @@ def _call_llm(system, msgs, max_tokens):
             raise _api_error(r)
         return "".join(b.get("text", "") for b in r.json().get("content", []))
     last = None
-    for i, model in enumerate(gemini_models()[:4]):
+    for i, model in enumerate(gemini_models()[:5]):
         try:
             return _gemini_once(model, system, msgs, max_tokens, 2 if i == 0 else 1)
         except Exception as e:  # retired model (404), blocked, busy... try the next one
@@ -720,7 +724,7 @@ def fetch_outlet(name, cat):
     url = OUTLETS[name]["feeds"].get(cat)
     if not url:
         return []
-    r = requests.get(url, headers=UA, timeout=6)
+    r = requests.get(url, headers=BROWSER_UA, timeout=8)
     r.raise_for_status()
     return parse_rss(r.text, "direct", name)
 
