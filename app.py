@@ -12,6 +12,7 @@ Features
 import os
 import re
 import io
+import base64
 import json
 import time
 import html
@@ -47,10 +48,11 @@ LANGS = {
     "Telugu (తెలుగు)": ("te", "te-IN"), "Malayalam (മലയാളം)": ("ml", "ml-IN"),
     "Marathi (मराठी)": ("mr", "mr-IN"), "Bengali (বাংলা)": ("bn", "bn-IN"),
     "Gujarati (ગુજરાતી)": ("gu", "gu-IN"), "Punjabi (ਪੰਜਾਬੀ)": ("pa", "pa-IN"),
-    "Urdu (اردو)": ("ur", "ur-IN"),
+    "Urdu (اردو)": ("ur", "ur-IN"), "Odia (ଓଡ଼ିଆ)": ("or", "or-IN"),
+    "Assamese (অসমীয়া)": ("as", "as-IN"), "Nepali (नेपाली)": ("ne", "ne-NP"),
 }
 CATEGORIES = {
-    "Top stories": None, "India": "NATION", "World": "WORLD", "Business": "BUSINESS",
+    "Top stories": None, "India": "NATION", "Karnataka": None, "World": "WORLD", "Business": "BUSINESS",
     "Technology": "TECHNOLOGY", "Science": "SCIENCE", "Health": "HEALTH",
     "Sports": "SPORTS", "Entertainment": "ENTERTAINMENT",
 }
@@ -68,6 +70,7 @@ TRUSTED_SOURCES = [
     "times of india", "deccan herald", "livemint", "mint", "economic times", "business standard",
     "al jazeera", "associated press", "ap news", "bloomberg", "theprint", "the print", "scroll",
     "the wire", "firstpost", "india today", "news18", "dd news", "prasar bharati", "isro", "who",
+    "bbc news", "npr", "ndtv", "hindustan times", "the indian express", "times of india", "the hindu", "al jazeera",
     "nature", "science", "financial express", "the guardian", "new york times", "washington post",
 ]
 CLICKBAIT = ["shocking", "you won't believe", "miracle", "secret", "exposed", "bombshell", "slams",
@@ -84,7 +87,7 @@ EMOJI_HINTS = {
     "water": "💧", "farmer": "🌾", "crop": "🌾", "solar": "☀️", "electric": "⚡", "car": "🚗",
     "phone": "📱", "football": "⚽", "olympic": "🏅", "medal": "🏅", "tourist": "🧳", "tour": "🧳",
 }
-CAT_EMOJI = {"Top stories": "📰", "India": "🇮🇳", "World": "🌍", "Business": "💼", "Technology": "💻",
+CAT_EMOJI = {"Top stories": "📰", "India": "🇮🇳", "Karnataka": "🏛️", "World": "🌍", "Business": "💼", "Technology": "💻",
              "Science": "🔬", "Health": "🩺", "Sports": "🏅", "Entertainment": "🎬"}
 
 DEMO_ARTICLES = [
@@ -146,12 +149,51 @@ CREATE TABLE IF NOT EXISTS chats(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts TEXT, question TEXT, answer TEXT);
 CREATE TABLE IF NOT EXISTS saved(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts TEXT, title TEXT, url TEXT, summary TEXT);
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash TEXT PRIMARY KEY, user_id INTEGER, expires TEXT);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 """
 
 
+def using_pg():
+    return bool(cfg("DATABASE_URL"))
+
+
+@st.cache_resource
+def _pg_pool():
+    from psycopg2.pool import ThreadedConnectionPool
+    return ThreadedConnectionPool(1, 6, cfg("DATABASE_URL"), connect_timeout=10)
+
+
+def _pg_run(sql, params=()):
+    import psycopg2
+    import psycopg2.extras
+    pool = _pg_pool()
+    for attempt in (1, 2):
+        con = pool.getconn()
+        try:
+            with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall() if cur.description else []
+            con.commit()
+            return rows
+        except Exception as e:
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            if attempt == 2 or not isinstance(e, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+                raise
+        finally:
+            pool.putconn(con)
+
+
 @st.cache_resource
 def init_db():
+    if using_pg():
+        for stmt in [t.strip() for t in SCHEMA.split(";") if t.strip()]:
+            _pg_run(stmt.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"))
+        return True
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute("PRAGMA journal_mode=WAL")
@@ -161,12 +203,19 @@ def init_db():
 
 
 def q(sql, params=()):
+    if using_pg():
+        return _pg_run(sql.replace("?", "%s"), params)
     with closing(sqlite3.connect(DB_PATH, timeout=15)) as con:
         con.row_factory = sqlite3.Row
         return con.execute(sql, params).fetchall()
 
 
 def x(sql, params=()):
+    if using_pg():
+        s2 = sql.replace("?", "%s")
+        ret = s2.lstrip().upper().startswith("INSERT INTO") and "INTO SESSIONS" not in s2.upper()
+        rows = _pg_run(s2 + (" RETURNING id" if ret else ""), params)
+        return rows[0]["id"] if ret and rows else None
     with closing(sqlite3.connect(DB_PATH, timeout=15)) as con:
         cur = con.execute(sql, params)
         con.commit()
@@ -174,8 +223,7 @@ def x(sql, params=()):
 
 
 def df_query(sql, params=()):
-    with closing(sqlite3.connect(DB_PATH, timeout=15)) as con:
-        return pd.read_sql_query(sql, con, params=params)
+    return pd.DataFrame([dict(r) for r in q(sql, params)])
 
 
 # ----------------------------------------------------------------------------
@@ -217,7 +265,7 @@ def signup(name, email, pw, age_group, consent):
 
 def login(email, pw):
     email = email.strip().lower()
-    bad = "Wrong email or password."
+    bad = "Wrong email or password. New here? Use the Sign up tab first."
     rows = q("SELECT * FROM users WHERE email=?", (email,))
     if not rows:
         hash_pw(pw, "00" * 16)  # keep timing similar
@@ -234,16 +282,56 @@ def login(email, pw):
     return True, u
 
 
-def set_user(row):
+def set_user(row, kind="login"):
     st.session_state.user = {"id": row["id"], "name": row["name"], "email": row["email"],
                              "age_group": row["age_group"]}
     st.session_state.kids_set = row["age_group"] != "18 or older"
-    log("login")
+    log(kind)
     award(1, "login")
 
 
+def _th(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def create_session(user_id):
+    """Remember-me token (14 days). Only its hash is stored in the database."""
+    tok = secrets.token_urlsafe(32)
+    x("DELETE FROM sessions WHERE expires<?", (iso(),))
+    x("INSERT INTO sessions(token_hash,user_id,expires) VALUES(?,?,?)",
+      (_th(tok), user_id, (now() + dt.timedelta(days=14)).isoformat(timespec="seconds")))
+    return tok
+
+
+def restore_session():
+    """After a refresh or the app waking up, log the person back in from the URL token."""
+    if st.session_state.get("user") or st.session_state.get("guest"):
+        return
+    tok = st.query_params.get("s")
+    if tok:
+        rows = q("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>?",
+                 (_th(tok), iso()))
+        if rows:
+            set_user(rows[0], "resume")
+            return
+        st.query_params.pop("s", None)
+        st.session_state.ls_clear = True
+    if st.query_params.get("g") == "1":
+        st.session_state.guest = True
+        st.session_state.kids_set = st.query_params.get("k") == "1"
+
+
+def end_session():
+    st.session_state.ls_clear = True
+    st.session_state.pop("ls_saved", None)
+    tok = st.query_params.get("s")
+    if tok:
+        x("DELETE FROM sessions WHERE token_hash=?", (_th(tok),))
+    st.query_params.clear()
+
+
 def delete_user_data(uid):
-    for t in ("feedback", "chats", "saved"):
+    for t in ("feedback", "chats", "saved", "sessions"):
         x(f"DELETE FROM {t} WHERE user_id=?", (uid,))
     x("UPDATE events SET user_id=NULL, detail='' WHERE user_id=?", (uid,))
     x("DELETE FROM users WHERE id=?", (uid,))
@@ -324,9 +412,37 @@ def ai_on():
     return bool(cfg("ANTHROPIC_API_KEY") or cfg("GEMINI_API_KEY"))
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
-def _llm_cached(system, messages_json, max_tokens):
-    msgs = json.loads(messages_json)
+def _api_error(r):
+    try:
+        e = r.json().get("error", {})
+        msg = e.get("message") if isinstance(e, dict) else str(e)
+    except Exception:
+        msg = r.text[:120]
+    return RuntimeError(f"HTTP {r.status_code}: {str(msg)[:140]}")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def gemini_model():
+    """Pick a working Gemini model automatically (model names change over time)."""
+    if cfg("GEMINI_MODEL"):
+        return cfg("GEMINI_MODEL")
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         headers={"x-goog-api-key": cfg("GEMINI_API_KEY")}, params={"pageSize": 200}, timeout=10)
+        r.raise_for_status()
+        names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+    except Exception:
+        return "gemini-flash-latest"
+    bad = ("lite", "tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma", "exp", "thinking")
+    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
+    for p in ("gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"):
+        if p in flash:
+            return p
+    return sorted(flash)[-1] if flash else (names[0] if names else "gemini-flash-latest")
+
+
+def _call_llm(system, msgs, max_tokens):
     if cfg("ANTHROPIC_API_KEY"):
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -334,30 +450,54 @@ def _llm_cached(system, messages_json, max_tokens):
                      "content-type": "application/json"},
             json={"model": cfg("ANTHROPIC_MODEL", "claude-haiku-5-5"), "max_tokens": max_tokens,
                   "system": system, "messages": msgs}, timeout=45)
-        r.raise_for_status()
+        if not r.ok:
+            raise _api_error(r)
         return "".join(b.get("text", "") for b in r.json().get("content", []))
-    model = cfg("GEMINI_MODEL", "gemini-2.0-flash")
-    r = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        headers={"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"},
-        json={"systemInstruction": {"parts": [{"text": system}]},
-              "contents": [{"role": "user" if m["role"] == "user" else "model",
-                            "parts": [{"text": m["content"]}]} for m in msgs],
-              "generationConfig": {"maxOutputTokens": max_tokens}}, timeout=45)
-    r.raise_for_status()
-    return "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model()}:generateContent"
+    headers = {"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"}
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user" if m["role"] == "user" else "model",
+                          "parts": [{"text": m["content"]}]} for m in msgs],
+            "generationConfig": {"maxOutputTokens": max_tokens * 2, "temperature": 0.7,
+                                 "thinkingConfig": {"thinkingBudget": 0}}}
+    r = requests.post(url, headers=headers, json=body, timeout=45)
+    if r.status_code == 400:  # model may not accept thinkingConfig
+        body["generationConfig"].pop("thinkingConfig")
+        r = requests.post(url, headers=headers, json=body, timeout=45)
+    if not r.ok:
+        raise _api_error(r)
+    cands = r.json().get("candidates", [])
+    text = "".join(p.get("text", "") for p in (cands[0].get("content", {}).get("parts", []) if cands else []))
+    if not text.strip():
+        raise RuntimeError("Empty reply (the answer was blocked or filtered)")
+    return text
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
+def _llm_cached(system, messages_json, max_tokens):
+    return _call_llm(system, json.loads(messages_json), max_tokens)
 
 
 def llm(system, messages, max_tokens=700):
     """Returns text, or None when AI is off / limit reached / call failed."""
     if not ai_on() or not ai_allowed():
         return None
-    log("ai")
     try:
-        return _llm_cached(system, json.dumps(messages), max_tokens).strip()
+        out = _llm_cached(system, json.dumps(messages), max_tokens).strip()
+        log("ai")  # only successful calls count toward the daily limit
+        st.session_state.pop("ai_err", None)
+        return out
     except Exception as e:
-        st.session_state.ai_err = type(e).__name__
+        st.session_state.ai_err = str(e)[:150]
         return None
+
+
+def ai_status():
+    if not ai_on():
+        return "The AI helper isn't set up yet. The site owner must add GEMINI_API_KEY in Streamlit Secrets."
+    if not ai_allowed():
+        return "You've used today's AI helpers. They refresh tomorrow."
+    return f"The AI service didn't answer ({st.session_state.get('ai_err', 'unknown reason')}). Please try again in a minute."
 
 
 def audience(kids):
@@ -380,12 +520,74 @@ def parse_date(s):
         return None
 
 
-def parse_rss(text, provider):
+
+B = "https://feeds.bbci.co.uk/news"
+HINDU = "https://www.thehindu.com"
+GUARD = "https://www.theguardian.com"
+HT = "https://www.hindustantimes.com/feeds/rss"
+IE = "https://indianexpress.com"
+TOI = "https://timesofindia.indiatimes.com/rssfeeds"
+OUTLETS = {
+    "BBC News": {"region": "global", "feeds": {
+        "Top stories": f"{B}/rss.xml", "World": f"{B}/world/rss.xml", "India": f"{B}/world/asia/india/rss.xml",
+        "Business": f"{B}/business/rss.xml", "Technology": f"{B}/technology/rss.xml",
+        "Science": f"{B}/science_and_environment/rss.xml", "Health": f"{B}/health/rss.xml",
+        "Sports": "https://feeds.bbci.co.uk/sport/rss.xml", "Entertainment": f"{B}/entertainment_and_arts/rss.xml"}},
+    "The Hindu": {"region": "india", "feeds": {
+        "Top stories": f"{HINDU}/news/feeder/default.rss", "India": f"{HINDU}/news/national/feeder/default.rss",
+        "World": f"{HINDU}/news/international/feeder/default.rss", "Karnataka": f"{HINDU}/news/national/karnataka/feeder/default.rss",
+        "Business": f"{HINDU}/business/feeder/default.rss", "Technology": f"{HINDU}/sci-tech/technology/feeder/default.rss",
+        "Science": f"{HINDU}/sci-tech/science/feeder/default.rss", "Sports": f"{HINDU}/sport/feeder/default.rss",
+        "Entertainment": f"{HINDU}/entertainment/feeder/default.rss"}},
+    "Al Jazeera": {"region": "global", "feeds": {
+        "Top stories": "https://www.aljazeera.com/xml/rss/all.xml", "World": "https://www.aljazeera.com/xml/rss/all.xml"}},
+    "The Guardian": {"region": "global", "feeds": {
+        "Top stories": f"{GUARD}/international/rss", "World": f"{GUARD}/world/rss", "Business": f"{GUARD}/business/rss",
+        "Technology": f"{GUARD}/technology/rss", "Science": f"{GUARD}/science/rss", "Sports": f"{GUARD}/sport/rss",
+        "Entertainment": f"{GUARD}/culture/rss"}},
+    "NPR": {"region": "global", "feeds": {
+        "Top stories": "https://feeds.npr.org/1001/rss.xml", "World": "https://feeds.npr.org/1004/rss.xml",
+        "Business": "https://feeds.npr.org/1006/rss.xml", "Science": "https://feeds.npr.org/1007/rss.xml",
+        "Technology": "https://feeds.npr.org/1019/rss.xml", "Health": "https://feeds.npr.org/1128/rss.xml"}},
+    "NDTV": {"region": "india", "feeds": {
+        "Top stories": "https://feeds.feedburner.com/ndtvnews-top-stories", "India": "https://feeds.feedburner.com/ndtvnews-india-news",
+        "World": "https://feeds.feedburner.com/ndtvnews-world-news", "Sports": "https://feeds.feedburner.com/ndtvsports-latest"}},
+    "The Indian Express": {"region": "india", "feeds": {
+        "Top stories": f"{IE}/feed/", "India": f"{IE}/section/india/feed/", "World": f"{IE}/section/world/feed/",
+        "Business": f"{IE}/section/business/feed/", "Technology": f"{IE}/section/technology/feed/",
+        "Sports": f"{IE}/section/sports/feed/", "Entertainment": f"{IE}/section/entertainment/feed/",
+        "Health": f"{IE}/section/lifestyle/health/feed/"}},
+    "Times of India": {"region": "india", "feeds": {
+        "Top stories": "https://timesofindia.indiatimes.com/rssfeedstopstories.cms", "India": f"{TOI}/-2128936835.cms",
+        "World": f"{TOI}/296589292.cms", "Business": f"{TOI}/1898055.cms", "Technology": f"{TOI}/66949542.cms",
+        "Sports": f"{TOI}/4719148.cms", "Entertainment": f"{TOI}/1081479906.cms"}},
+    "Hindustan Times": {"region": "india", "feeds": {
+        "Top stories": f"{HT}/topnews/rssfeed.xml", "India": f"{HT}/india-news/rssfeed.xml", "World": f"{HT}/world-news/rssfeed.xml",
+        "Business": f"{HT}/business/rssfeed.xml", "Sports": f"{HT}/sports/rssfeed.xml",
+        "Entertainment": f"{HT}/entertainment/rssfeed.xml", "Technology": f"{HT}/technology/rssfeed.xml"}},
+}
+SOURCE_CHOICES = ["All trusted media", "Indian media", "Global media"]
+
+
+def clean_author(v):
+    v = strip_tags(v or "")
+    m = re.search(r"\(([^)]+)\)", v)
+    if m:
+        v = m.group(1)
+    return "" if ("@" in v or len(v) > 60) else v.strip()
+
+
+def parse_rss(text, provider, outlet=""):
     items = []
     for it in ET.fromstring(text).iter("item"):
         d = {}
         for ch in it:
-            d.setdefault(ch.tag.split("}")[-1].lower(), (ch.text or "").strip())
+            tag = ch.tag.split("}")[-1].lower()
+            if tag in ("thumbnail", "content", "enclosure") and not d.get("img"):
+                u = ch.get("url", "")
+                if u.startswith("https://") and re.search(r"\.(jpe?g|png|webp)|image", u + ch.get("type", "") + ch.get("medium", ""), re.I):
+                    d["img"] = u
+            d.setdefault(tag, (ch.text or "").strip())
         title, link = strip_tags(d.get("title", "")), d.get("link", "")
         if provider == "bing":
             link = parse_qs(urlparse(link).query).get("url", [link])[0]
@@ -393,11 +595,16 @@ def parse_rss(text, provider):
         if provider == "google" and source and title.endswith(" - " + source):
             title = title[: -len(source) - 3]
         desc = strip_tags(d.get("description", ""))
-        if desc.lower().startswith(title.lower()[:40]):
+        enc = strip_tags(d.get("encoded", ""))
+        if len(enc) > len(desc):
+            desc = enc
+        if desc.lower().startswith(title.lower()[:40]) and len(desc) < len(title) + 40:
             desc = ""
-        items.append({"title": title, "source": source or provider.title(), "url": link,
-                      "published": parse_date(d.get("pubdate", "")), "text": desc or title,
-                      "image": d.get("image", "") if d.get("image", "").startswith("https://") else ""})
+        img = d.get("img") or d.get("image", "")
+        items.append({"title": title, "source": outlet or source or provider.title(), "url": link,
+                      "published": parse_date(d.get("pubdate", "") or d.get("date", "")), "text": (desc or title)[:5000],
+                      "author": clean_author(d.get("creator") or d.get("author", "")),
+                      "image": img if img.startswith("https://") else ""})
     return items
 
 
@@ -424,50 +631,104 @@ def fetch_newsapi(query, cat, n):
         except Exception:
             pass
         out.append({"title": strip_tags(a.get("title") or ""), "source": (a.get("source") or {}).get("name", ""),
+                    "author": clean_author(a.get("author") or ""),
                     "url": a.get("url", ""), "published": pub, "text": txt or a.get("title", ""),
                     "image": (a.get("urlToImage") or "") if (a.get("urlToImage") or "").startswith("https://") else ""})
     return out
 
 
-def fetch_rss(query, cat):
+def _rss_bing(query, cat):
     qtxt = query or (f"{cat} news India" if cat not in (None, "Top stories") else "India top news")
-    try:
-        r = requests.get("https://www.bing.com/news/search", params={"q": qtxt, "format": "rss", "mkt": "en-IN"},
-                         headers=UA, timeout=12)
-        r.raise_for_status()
-        items = parse_rss(r.text, "bing")
-        if items:
-            return items
-    except Exception:
-        pass
-    base = "https://news.google.com/rss"
-    tail = "hl=en-IN&gl=IN&ceid=IN:en"
+    r = requests.get("https://www.bing.com/news/search", params={"q": qtxt, "format": "rss", "mkt": "en-IN"},
+                     headers=UA, timeout=6)
+    r.raise_for_status()
+    return parse_rss(r.text, "bing")
+
+
+def _rss_google(query, cat):
+    base, tail = "https://news.google.com/rss", "hl=en-IN&gl=IN&ceid=IN:en"
     if query:
         url = f"{base}/search?q={quote_plus(query)}&{tail}"
     elif CATEGORIES.get(cat):
         url = f"{base}/headlines/section/topic/{CATEGORIES[cat]}?{tail}"
     else:
         url = f"{base}?{tail}"
-    r = requests.get(url, headers=UA, timeout=12)
+    r = requests.get(url, headers=UA, timeout=6)
     r.raise_for_status()
     return parse_rss(r.text, "google")
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_news(query, cat, n, kids):
-    """Returns (articles, note). Never raises."""
+def fetch_rss(query, cat):
+    """Ask Bing and Google at the same time; use the first that returns stories."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(_rss_bing, query, cat), ex.submit(_rss_google, query, cat)]
+        for f in futs:
+            try:
+                items = f.result(timeout=9)
+                if items:
+                    return items
+            except Exception:
+                continue
+    return []
+
+
+def fetch_outlet(name, cat):
+    url = OUTLETS[name]["feeds"].get(cat)
+    if not url:
+        return []
+    r = requests.get(url, headers=UA, timeout=6)
+    r.raise_for_status()
+    return parse_rss(r.text, "direct", name)
+
+
+def outlets_for(choice):
+    if choice == "Indian media":
+        return [k for k, v in OUTLETS.items() if v["region"] == "india"]
+    if choice == "Global media":
+        return [k for k, v in OUTLETS.items() if v["region"] == "global"]
+    return [choice] if choice in OUTLETS else list(OUTLETS)
+
+
+def interleave(lists):
+    out, i = [], 0
+    while any(i < len(l) for l in lists):
+        for l in lists:
+            if i < len(l):
+                out.append(l[i])
+        i += 1
+    return out
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _fetch_live(query, cat, n, kids, source):
+    """Publisher feeds first (BBC, The Hindu, Guardian...), search engines as top-up. Raises if empty."""
     want = n * 2 if kids else n
-    items, note = [], ""
-    try:
-        if cfg("NEWSAPI_KEY"):
-            items = fetch_newsapi(query, cat, min(want, 50))
-    except Exception:
-        items = []
-    if not items:
+    names = outlets_for(source)
+    feed_cat = "Top stories" if query else cat
+    per = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(fetch_outlet, nm, feed_cat) for nm in names]
+        for f in futs:
+            try:
+                per.append(f.result(timeout=9)[:15])
+            except Exception:
+                per.append([])
+    if query:
+        words = re.findall(r"\w{3,}", query.lower())
+        per = [[a for a in l if any(w in (a["title"] + " " + a["text"]).lower() for w in words)] for l in per]
+    items = interleave(per)
+    if len(items) < want and (source in SOURCE_CHOICES or query):
+        extra = []
         try:
-            items = fetch_rss(query, cat)
+            if cfg("NEWSAPI_KEY"):
+                extra = fetch_newsapi(query, cat, min(want, 50))
         except Exception:
-            items = []
+            extra = []
+        if not extra:
+            extra = fetch_rss(query, cat)
+        if source in OUTLETS:
+            extra = [e for e in extra if source.lower() in e["source"].lower()]
+        items += extra
     if kids:
         items = [a for a in items if not KIDS_BLOCK.search(a["title"] + " " + a["text"])]
     seen, uniq = set(), []
@@ -477,8 +738,16 @@ def fetch_news(query, cat, n, kids):
             seen.add(k)
             uniq.append(a)
     if not uniq:
-        return DEMO_ARTICLES[:n], "Live news couldn't be loaded right now, so these are sample stories. Try again in a minute."
-    return uniq[:n], note
+        raise RuntimeError("no stories")
+    return uniq[:n]
+
+
+def fetch_news(query, cat, n, kids, source="All trusted media"):
+    """Returns (articles, note). Never raises."""
+    try:
+        return _fetch_live(query, cat, n, kids, source), ""
+    except Exception:
+        return DEMO_ARTICLES[:n], "Live news couldn't be loaded right now, so these are sample stories. Tap Get news to try again."
 
 
 def public_url(url):
@@ -495,19 +764,32 @@ def public_url(url):
         return False
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def extract_article(url):
-    """Best-effort article body (first paragraphs). Returns '' on any problem."""
+JUNK = re.compile(r"(cookie|subscribe|sign up|newsletter|advertisement|all rights reserved|follow us|click here|"
+                  r"read more:|also read|download the app|whatsapp channel|terms of use|privacy policy)", re.I)
+
+
+def _extract(url):
     if not public_url(url):
         return ""
+    r = requests.get(url, headers=UA, timeout=6, allow_redirects=True)
+    if "text/html" not in r.headers.get("content-type", ""):
+        return ""
+    body = r.text[:900000]
+    m = re.search(r"<article[^>]*>(.*?)</article>", body, flags=re.S | re.I)
+    paras = [strip_tags(p) for p in re.findall(r"<p[^>]*>(.*?)</p>", m.group(1) if m else body, flags=re.S | re.I)]
+    return " ".join(p for p in paras if len(p) > 60 and not JUNK.search(p))[:7000]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def extract_article(url):
+    """Best-effort article body. Gives up after 7 seconds so the app never hangs."""
+    ex = ThreadPoolExecutor(max_workers=1)
     try:
-        r = requests.get(url, headers=UA, timeout=8, allow_redirects=True)
-        if "text/html" not in r.headers.get("content-type", ""):
-            return ""
-        paras = [strip_tags(p) for p in re.findall(r"<p[^>]*>(.*?)</p>", r.text[:600000], flags=re.S | re.I)]
-        return " ".join(p for p in paras if len(p) > 60)[:3500]
+        return ex.submit(_extract, url).result(timeout=7)
     except Exception:
         return ""
+    finally:
+        ex.shutdown(wait=False)
 
 
 # ----------------------------------------------------------------------------
@@ -524,10 +806,15 @@ def short_summary(a, limit=320):
     return out[:limit + 80]
 
 
+@st.cache_resource
+def _vader():
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    return SentimentIntensityAnalyzer()
+
+
 def sentiment(text):
     try:
-        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-        c = SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
+        c = _vader().polarity_scores(text)["compound"]
     except Exception:
         pos = len(re.findall(r"\b(win|wins|launch|rolls out|success|boost|growth|record|award|praise|safe)\b", text, re.I))
         neg = len(re.findall(r"\b(crash|fall|loss|attack|death|fail|crisis|glitch|ban|fire|flood)\b", text, re.I))
@@ -610,35 +897,43 @@ def _tr_direct(text, code):
     return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
 
 
-LOCALE = {c: loc for c, loc in LANGS.values()}
+def _gtx(text, code):
+    out = []
+    for c in _chunks(text, 1200):
+        r = requests.get("https://translate.googleapis.com/translate_a/single", headers=UA, timeout=8,
+                         params={"client": "gtx", "sl": "auto", "tl": code, "dt": "t", "q": c})
+        r.raise_for_status()
+        out.append("".join(seg[0] for seg in r.json()[0] if seg and seg[0]))
+    return " ".join(out)
+
+
+def _deep(text, code):
+    from deep_translator import GoogleTranslator
+    return " ".join(GoogleTranslator(source="auto", target=code).translate(c) for c in _chunks(text, 4000))
+
+
+def _mymemory(text, code):
+    out = []
+    for c in _chunks(text, 450):
+        r = requests.get("https://api.mymemory.translated.net/get", timeout=8,
+                         params={"q": c, "langpair": f"en|{code}"})
+        r.raise_for_status()
+        j = r.json()
+        t = html.unescape(j.get("responseData", {}).get("translatedText", ""))
+        if str(j.get("responseStatus")) != "200" or not t:
+            raise RuntimeError(str(j.get("responseDetails", "no result"))[:80])
+        out.append(t)
+    return " ".join(out)
 
 
 def _tr(text, code):
-    """Try Google first, then MyMemory as a backup. Raises only if both fail."""
-    from deep_translator import GoogleTranslator, MyMemoryTranslator
     errs = []
-    try:
-        out = []
-        for c in _chunks(text, 4000):
-            for attempt in range(3):
-                try:
-                    out.append(GoogleTranslator(source="auto", target=code).translate(c))
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(0.7 * (attempt + 1))
-        return " ".join(out)
-    except Exception as e:
-        errs.append(f"google:{type(e).__name__}")
-    try:
-        out = [MyMemoryTranslator(source="en-GB", target=LOCALE.get(code, code)).translate(c)
-               for c in _chunks(text, 450)]
-        if all(out):
-            return " ".join(out)
-    except Exception as e:
-        errs.append(f"mymemory:{type(e).__name__}")
-    raise RuntimeError(" / ".join(errs) or "translation failed")
+    for name, fn in (("google", _gtx), ("google2", _deep), ("mymemory", _mymemory)):
+        try:
+            return fn(text, code)
+        except Exception as e:
+            errs.append(f"{name}: {type(e).__name__} {str(e)[:60]}")
+    raise RuntimeError(" | ".join(errs))
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -652,29 +947,48 @@ def translate(text, code):
 def translate_many(texts, code):
     if code == "en":
         return list(texts)
-    errs = []
 
     def one(t):
         try:
-            return _tr(t, code)
+            return _tr(t, code), None
         except Exception as e:
-            errs.append(str(e))
-            return None
-    with ThreadPoolExecutor(max_workers=4) as ex:
+            return None, str(e)
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res = list(ex.map(one, texts))
-    if texts and all(r is None for r in res):
-        raise RuntimeError(errs[0] if errs else "translation failed")
-    return [r if r is not None else t for r, t in zip(res, texts)]
+    if texts and all(r[0] is None for r in res):
+        raise RuntimeError(next((r[1] for r in res if r[1]), "translation failed"))
+    return [r[0] if r[0] is not None else t for r, t in zip(res, texts)]
+
+
+def llm_translate(texts, code):
+    """Backup: translate with the AI helper in one request. Returns list or None."""
+    lang = next((k.split(" ")[0] for k, v in LANGS.items() if v[0] == code), code)
+    numbered = "\n".join(f"{i + 1}. {' '.join(t.split())}" for i, t in enumerate(texts))
+    out = llm("You are a precise translator.", [{"role": "user", "content":
+              f"Translate each numbered line into {lang}. Keep the same numbering, one line per item, no extra text.\n{numbered}"}], 1500)
+    if not out:
+        return None
+    res = {}
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)[.)]\s*(.+)", line)
+        if m:
+            res[int(m.group(1))] = m.group(2).strip()
+    return [res.get(i + 1) or texts[i] for i in range(len(texts))] if res else None
 
 
 def tr_safe(text):
-    """Translate to the user's chosen language; fall back to English with a notice."""
+    """Translate to the user's chosen language; fall back to AI, then to English with the reason."""
     code = LANGS[st.session_state.lang][0]
+    if code == "en":
+        return text
     try:
         return translate(text, code)
     except Exception as e:
-        st.warning("Translation is busy right now, so this is shown in English. Please try again in a moment.")
-        st.caption(f"Technical detail: {str(e)[:160]}")
+        alt = llm_translate([text], code)
+        if alt:
+            return alt[0]
+        st.warning("Translation is not working right now, so this is shown in English.")
+        st.caption(f"Details: {str(e)[:200]}")
         return text
 
 
@@ -724,46 +1038,131 @@ def dictionary_intent(msg):
 # ----------------------------------------------------------------------------
 # Story Studio content
 # ----------------------------------------------------------------------------
-def article_text(a):
-    return (a.get("full") or a["text"])[:3000]
+def article_text(a, n=3000):
+    return (a.get("full") or a["text"])[:n]
 
 
 def explain_simply(a):
     kids = st.session_state.kids
     out = llm(SYSTEM_BASE, [{"role": "user", "content":
         f"Audience: {audience(kids)}.\nExplain this news in 4-5 short sentences, then one line starting "
-        f"'Why it matters:'. Do not use bullet points.\nTitle: {a['title']}\nText: {article_text(a)}"}], 450)
+        f"'Why it matters:'. Do not use bullet points. " + STRICT + f"\nTitle: {a['title']}\nText: {article_text(a, 4500)}"}], 450)
     if out:
         return out
-    return short_summary(a, 260) + "\n\n(Tip: add a free GEMINI_API_KEY in Secrets to get a child-friendly explanation here.)"
+    return short_summary(a, 260) + "\n\n(Tip: the AI helper gives a child-friendly explanation here.)"
+
+
+STRICT = ("Use ONLY facts that appear in the provided text. Never add facts, numbers, names, dates, quotes or "
+          "background that are not in the text. If something is not stated, say 'Not stated in the source'. "
+          "Keep names and numbers exactly as written.")
+
+
+def sentences(text, lo=30, hi=420):
+    return [t.strip() for t in re.split(r"(?<=[.!?])\s+", text) if lo <= len(t.strip()) <= hi]
+
+
+def make_briefing(a):
+    """Point-wise briefing. Returns (markdown, written_by_ai, based_on_full_text)."""
+    kids = st.session_state.kids
+    full = len(a.get("full", "")) >= 500
+    src = article_text(a, 6000) if full else a["text"]
+    long_ok = len(src) > 1500
+    out = llm(SYSTEM_BASE + " " + STRICT, [{"role": "user", "content":
+        f"Write a point-wise news briefing for {audience(kids)}. Use exactly these Markdown headings, each followed by "
+        "short bullet points ('- '):\n**📌 In one line**\n**🧾 What happened**\n**👥 Who and where**\n"
+        "**🔢 Key facts and numbers**\n**💡 Why it matters**\n**⏭️ What to watch next** (only if the text says; "
+        "otherwise write 'Not stated in the source').\n"
+        + ("Aim for about 350-450 words in total.\n" if long_ok else
+           "The text is short, so write fewer bullets instead of guessing.\n")
+        + f"Title: {a['title']}\nSource: {a['source']}\nText: {src}"}], 1300)
+    if out:
+        return out, True, full
+    pts = sentences(src)[: 10 if full else 5] or [a["title"]]
+    md = ("**📌 In one line**\n- " + a["title"] + "\n\n**🧾 Key points from the article**\n"
+          + "\n".join("- " + p for p in pts))
+    return md, False, full
+
+
+def translate_markdown(md, code):
+    """Translate a Markdown briefing line by line so bullets and headings survive."""
+    if code == "en":
+        return md
+    rows = []
+    for line in md.splitlines():
+        m = re.match(r"^(\s*(?:[-*•]\s+|#+\s+)?)(\*\*)?(.*?)(\*\*)?\s*$", line)
+        rows.append((m.group(1), bool(m.group(2)), m.group(3)) if m and m.group(3) else None)
+    bodies = tuple(r[2] for r in rows if r)
+    try:
+        tr = list(translate_many(bodies, code))
+    except Exception:
+        tr = llm_translate(list(bodies), code)
+        if not tr:
+            st.warning("Translation is not working right now, so this is shown in English.")
+            return md
+    it, out = iter(tr), []
+    for r in rows:
+        if r is None:
+            out.append("")
+        else:
+            t = next(it)
+            out.append(f"{r[0]}**{t}**" if r[1] else f"{r[0]}{t}")
+    return "\n".join(out)
+
+
+ACTIONS = {"wave", "jump", "point", "think", "cheer", "surprise"}
+MOTIONS = {"float", "drive", "fly", "spin", "shake", "zoom"}
+MOTION_HINT = {"🚌": "drive", "🚆": "drive", "🚗": "drive", "🚇": "drive", "✈️": "fly", "🚀": "fly", "🌍": "spin",
+               "🔥": "shake", "⚡": "shake", "🏏": "zoom", "⚽": "zoom", "📈": "zoom"}
+DEFAULT_ACTIONS = ["wave", "point", "think", "jump", "point", "surprise", "cheer", "wave"]
+OUTRO = ("That's your NewsVerse update! Always open the source link to double-check the facts. "
+         "Stay curious, and see you next time. Bye bye!")
+
+
+def _finish_panels(panels, em):
+    for i, p in enumerate(panels):
+        if p.get("action") not in ACTIONS:
+            p["action"] = DEFAULT_ACTIONS[i % len(DEFAULT_ACTIONS)]
+        first = p["emoji"].strip()[:2] if p.get("emoji") else em
+        p["motion"] = p.get("motion") if p.get("motion") in MOTIONS else MOTION_HINT.get(first, "float")
+    return panels
 
 
 def cartoon_script(a):
+    """8-panel comic (about 45-60 seconds). Facts come only from the article text."""
     kids = st.session_state.kids
-    out = llm(SYSTEM_BASE, [{"role": "user", "content":
-        "Write a 4-panel comic for this news, starring Newsie the owl (explains) and Kiki the tiger cub (asks "
-        f"questions). Audience: {audience(kids)}. Panel flow: what happened -> where/who -> why it matters -> a "
-        "closing takeaway. Reply with ONLY a JSON array of 4 objects: "
-        '{"speaker":"Newsie" or "Kiki","emoji":"1-3 emojis for the scene","text":"max 22 words"}.\n'
-        f"Title: {a['title']}\nText: {article_text(a)}"}], 600)
+    em = guess_emoji(a["title"] + " " + a["text"])
+    out = llm(SYSTEM_BASE + " " + STRICT, [{"role": "user", "content":
+        "Write an animated 7-panel comic script explaining this news, starring Newsie the owl (explains) and Kiki the "
+        f"tiger cub (asks questions). Audience: {audience(kids)}. Flow: 1 hook, 2 what happened, 3 who and where, "
+        "4 an important fact, 5 another fact or number, 6 why it matters, 7 a recap of the 3 things to remember. "
+        "Each text must be 15-30 words. Reply with ONLY a JSON array of 7 objects: "
+        '{"speaker":"Newsie" or "Kiki","emoji":"1-3 emojis for the scene","text":"...",'
+        '"action":"wave|jump|point|think|cheer|surprise","motion":"float|drive|fly|spin|shake|zoom"}.\n'
+        f"Title: {a['title']}\nText: {article_text(a, 4500)}"}], 1500)
     if out:
         try:
             arr = json.loads(out[out.index("["): out.rindex("]") + 1])
             panels = [{"speaker": "Kiki" if str(p.get("speaker", "")).lower().startswith("k") else "Newsie",
-                       "emoji": str(p.get("emoji", "📰"))[:12], "text": str(p.get("text", ""))[:200]}
-                      for p in arr[:4] if p.get("text")]
-            if len(panels) >= 3:
-                return panels, True
+                       "emoji": str(p.get("emoji", em))[:12], "text": str(p.get("text", ""))[:260],
+                       "action": str(p.get("action", "")).lower(), "motion": str(p.get("motion", "")).lower()}
+                      for p in arr[:7] if p.get("text")]
+            if len(panels) >= 5:
+                panels.append({"speaker": "Newsie", "emoji": "👋🎉", "text": OUTRO, "action": "wave", "motion": "zoom"})
+                return _finish_panels(panels, em), True
         except Exception:
             pass
-    sents = [t for t in re.split(r"(?<=[.!?])\s+", a["text"]) if len(t) > 15][:3]
-    em = guess_emoji(a["title"] + " " + a["text"])
-    fact = sents[0][:200] if sents else a["title"]
-    more = sents[1][:170] if len(sents) > 1 else "Wow! I want to read the full story. Where can I check it?"
-    base = [("Newsie", em, f"Hello friends! Today's news: {a['title'][:150]}"),
-            ("Kiki", "🤔", "Ooh! Tell me more, Newsie. What happened?"),
-            ("Newsie", em, fact), ("Kiki", "😮", more)]
-    return [{"speaker": sp, "emoji": e, "text": t} for sp, e, t in base], False
+    facts = sentences(article_text(a, 4000), 30, 230)
+    first = facts[0] if facts else a["title"]
+    rest = facts[1:5]
+    base = [("Newsie", em, f"Hello friends! Here is today's news: {a['title'][:150]}"),
+            ("Kiki", "🤔", "Ooh! Tell me more, Newsie. What exactly happened?"),
+            ("Newsie", em, first)]
+    for i, f in enumerate(rest):
+        base.append(("Kiki" if i % 2 == 0 else "Newsie", "📌" if i % 2 == 0 else em, f))
+    base.append(("Kiki", "🧠", "So the big thing to remember is: " + a["title"][:140]))
+    base.append(("Newsie", "👋🎉", OUTRO))
+    panels = [{"speaker": sp, "emoji": e, "text": t} for sp, e, t in base]
+    return _finish_panels(panels, em), False
 
 
 CARTOON_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -794,6 +1193,37 @@ CARTOON_TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><meta na
 button{font:800 16px Nunito;background:#FFC93C;color:#1c1650;border:3px solid #1c1650;border-radius:14px;padding:10px 18px;min-height:46px;cursor:pointer;box-shadow:0 4px 0 #1c1650}
 button:active{transform:translateY(3px);box-shadow:none}button:focus-visible{outline:3px solid #fff;outline-offset:2px}
 .hint{font-size:12px;color:#1c1650;text-align:center;margin-top:8px;opacity:.8}
+.stage>*{position:relative;z-index:1}
+.stage:before,.stage:after{content:"☁️";position:absolute;top:28px;left:-70px;font-size:42px;opacity:.85;animation:cloud 26s linear infinite;z-index:0}
+.stage:after{top:78px;font-size:30px;animation-duration:38s;animation-delay:-14s}
+.scene{display:block}
+.m-float{animation:pop .5s ease-out,bob 2.6s .5s ease-in-out infinite}
+.m-drive{animation:pop .5s ease-out,drive 2.6s .5s ease-in-out infinite alternate}
+.m-fly{animation:pop .5s ease-out,fly 2s .5s ease-in-out infinite alternate}
+.m-spin{animation:pop .5s ease-out,spin 4s .5s linear infinite}
+.m-shake{animation:pop .5s ease-out,shake .3s .5s linear infinite}
+.m-zoom{animation:pop .5s ease-out,zoom 1.4s .5s ease-in-out infinite alternate}
+.char svg{transform-origin:50% 100%}
+.char.act-jump svg{animation:jump .7s ease-in-out infinite}
+.char.act-wave svg{animation:wave .7s ease-in-out infinite}
+.char.act-point svg{animation:point .9s ease-in-out infinite}
+.char.act-think svg{animation:think 1.6s ease-in-out infinite}
+.char.act-cheer svg{animation:cheer .55s ease-in-out infinite}
+.char.act-surprise svg{animation:surprise .4s ease-in-out infinite}
+.cf{position:absolute;top:-20px;font-size:22px;animation:fall 2.8s linear forwards;z-index:5;pointer-events:none}
+@keyframes cloud{to{left:110%}}
+@keyframes drive{from{transform:translateX(-120px) scaleX(1)}to{transform:translateX(120px)}}
+@keyframes fly{from{transform:translateY(8px) rotate(-8deg)}to{transform:translateY(-18px) rotate(8deg)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes shake{25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}
+@keyframes zoom{from{transform:scale(.9)}to{transform:scale(1.22)}}
+@keyframes jump{50%{transform:translateY(-18px) scale(1.04)}}
+@keyframes wave{50%{transform:rotate(7deg)}0%,100%{transform:rotate(-7deg)}}
+@keyframes point{50%{transform:translateX(12px) rotate(5deg)}}
+@keyframes think{50%{transform:rotate(-9deg) translateY(-3px)}}
+@keyframes cheer{50%{transform:translateY(-14px) rotate(9deg)}0%,100%{transform:rotate(-9deg)}}
+@keyframes surprise{50%{transform:scale(1.12)}}
+@keyframes fall{to{transform:translateY(560px) rotate(540deg);opacity:.9}}
 @keyframes blink{0%,94%,100%{transform:scaleY(1)}97%{transform:scaleY(.08)}}
 @keyframes chomp{50%{transform:scaleY(1.7)}}
 @keyframes bob{50%{translate:0 -6px}}
@@ -829,33 +1259,57 @@ button:active{transform:translateY(3px);box-shadow:none}button:focus-visible{out
  <div class="bubble" aria-live="polite"><b id="who"></b><span id="txt"></span></div>
  <div class="dots" id="dots"></div>
  <div class="ctl"><button id="play">▶ Play the story</button><button id="next">⏭ Next</button></div>
- <div class="hint">🔊 Turn your volume up. The voice comes from your phone or laptop, so a language may need its voice installed.</div>
+ <div class="hint" id="hint">🔊 Turn your volume up and press Play.</div>
 </div>
 <script>
 (function(){
 const P=__PANELS__,LANG="__LANG__",$=id=>document.getElementById(id);
-const scene=$('scene'),who=$('who'),txt=$('txt'),dots=$('dots'),play=$('play'),next=$('next');
-let idx=0,playing=false,tok=0,typer=null;
+const scene=$('scene'),who=$('who'),txt=$('txt'),dots=$('dots'),play=$('play'),next=$('next'),hint=$('hint');
+let idx=0,playing=false,tok=0,typer=null,voices=[];
 dots.innerHTML=P.map(()=>'<i></i>').join('');
-const synth=window.speechSynthesis;
+const synth=window.speechSynthesis,au=new Audio();window._keep=[];
+function loadV(){voices=synth?synth.getVoices():[];}
+if(synth){loadV();synth.onvoiceschanged=loadV;}
+function pickVoice(){const l=LANG.toLowerCase(),pl=l.split('-')[0];
+ const exact=voices.filter(v=>v.lang.toLowerCase().replace('_','-')===l);
+ const same=voices.filter(v=>v.lang.toLowerCase().replace('_','-').startsWith(pl));
+ const pool=exact.length?exact:same;if(!pool.length)return null;
+ return pool.find(v=>/natural|google|online/i.test(v.name))||pool[0];}
+function confetti(){const e=['\ud83c\udf89','\u2b50','\ud83c\udf88','\u2728'];for(let k=0;k<26;k++){const c=document.createElement('span');c.className='cf';c.textContent=e[k%4];c.style.left=Math.random()*95+'%';c.style.animationDelay=Math.random()*1.2+'s';$('stage').appendChild(c);setTimeout(()=>c.remove(),4500);}}
 function talk(on){['Newsie','Kiki'].forEach(n=>$(n).classList.toggle('talk',on));}
+function chunks(t){const s=t.match(/[^.!?\u0964]+[.!?\u0964]*\s*/g)||[t],out=[];let cur='';
+ s.forEach(x=>{if((cur+x).length>150&&cur){out.push(cur);cur='';}cur+=x;});if(cur)out.push(cur);return out;}
+function say(p,done,my){
+ if(p.audio){au.pause();au.src='data:audio/mpeg;base64,'+p.audio;const k=p.speaker==='Kiki';
+  au.preservesPitch=!k;au.webkitPreservesPitch=!k;au.playbackRate=k?1.15:1;au.onended=done;au.onerror=done;
+  const pr=au.play();if(pr&&pr.catch)pr.catch(done);return;}
+ const wait=()=>setTimeout(done,Math.max(2500,p.text.length*75));
+ if(!synth){wait();return;}
+ const v=pickVoice();
+ if(!v&&!LANG.startsWith('en')){hint.textContent='\u26a0\ufe0f This device has no '+LANG+' voice. Turn on "Clear voice" above, or install that language voice in your device settings.';wait();return;}
+ const parts=chunks(p.text);let n=0;
+ const go=()=>{if(my!==tok)return;if(n>=parts.length){done();return;}
+  const u=new SpeechSynthesisUtterance(parts[n++]);u.lang=LANG;if(v)u.voice=v;u.rate=.92;u.pitch=p.speaker==='Kiki'?1.4:1;
+  u.onend=go;u.onerror=e=>{if(e.error==='canceled'||e.error==='interrupted')return;go();};
+  window._keep.push(u);synth.speak(u);};
+ setTimeout(go,150);
+}
 function show(i,speak){
- idx=i;const p=P[i],my=++tok;clearInterval(typer);if(synth)synth.cancel();
- scene.textContent=p.emoji;scene.classList.remove('pop');void scene.offsetWidth;scene.classList.add('pop');
+ idx=i;const p=P[i],my=++tok;clearInterval(typer);if(synth)synth.cancel();au.pause();
+ scene.textContent=p.emoji;scene.className='scene';void scene.offsetWidth;scene.className='scene m-'+(p.motion||'float');
  who.textContent=p.speaker;txt.textContent='';
- ['Newsie','Kiki'].forEach(n=>$(n).classList.toggle('active',n===p.speaker));
+ ['Newsie','Kiki'].forEach(n=>{const c=$(n);c.className=c.className.replace(/\bact-\w+/g,'').trim();c.classList.toggle('active',n===p.speaker);});$(p.speaker).classList.add('act-'+(p.action||'wave'));
  [...dots.children].forEach((d,k)=>d.classList.toggle('on',k===i));
  let k=0;typer=setInterval(()=>{txt.textContent=p.text.slice(0,++k);if(k>=p.text.length)clearInterval(typer);},speak?32:12);
  if(!speak){talk(false);return;}
- talk(true);const fin=()=>{if(my!==tok)return;talk(false);
-  if(playing&&i+1<P.length)setTimeout(()=>{if(my===tok)show(i+1,true)},450);
-  else if(i+1>=P.length){playing=false;play.textContent='🔁 Play again';}};
- if(synth){const u=new SpeechSynthesisUtterance(p.text);u.lang=LANG;u.rate=.95;u.pitch=p.speaker==='Kiki'?1.45:1.0;
-  u.onend=fin;u.onerror=fin;synth.speak(u);
-  setTimeout(()=>{if(my===tok&&!synth.speaking&&!synth.pending)fin();},1500);}
- else setTimeout(fin,Math.max(2500,p.text.length*75));
+ talk(true);let fin=false;
+ const done=()=>{if(fin||my!==tok)return;fin=true;talk(false);
+  if(playing&&i+1<P.length)setTimeout(()=>{if(my===tok)show(i+1,true);},400);
+  else if(i+1>=P.length){playing=false;play.textContent='\ud83d\udd01 Play again';hint.textContent='\ud83c\udf89 The End! Try the Briefing or Quiz for more.';confetti();}};
+ say(p,done,my);
+ setTimeout(done,9000+p.text.length*120);
 }
-play.onclick=()=>{playing=true;play.textContent='⏸ Restart';show(0,true);};
+play.onclick=()=>{playing=true;play.textContent='\u23f8 Restart';show(0,true);};
 next.onclick=()=>{playing=true;show(Math.min(idx+1,P.length-1),true);};
 show(0,false);
 })();
@@ -864,10 +1318,21 @@ show(0,false);
 
 def cartoon_html(panels, voice_lang, title):
     data = json.dumps(
-        [{"speaker": p["speaker"], "emoji": p["emoji"], "text": p["text"]} for p in panels],
+        [{"speaker": p["speaker"], "emoji": p["emoji"], "text": p["text"], "audio": p.get("audio", ""),
+          "action": p.get("action", "wave"), "motion": p.get("motion", "float")} for p in panels],
         ensure_ascii=False).replace("</", "<\\/")
     return (CARTOON_TEMPLATE.replace("__PANELS__", data)
             .replace("__LANG__", esc(voice_lang)).replace("__TITLE__", esc(title[:80])))
+
+
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=300)
+def tts_b64(text, code, who):
+    """Clear server voice that works for every language on every device."""
+    from gtts import gTTS
+    kw = {"tld": "co.in" if who == "Newsie" else "com.au"} if code == "en" else {}
+    buf = io.BytesIO()
+    gTTS(text=text, lang=code, **kw).write_to_fp(buf)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def make_quiz(a):
@@ -911,7 +1376,8 @@ h1,h2,h3,h4,.nv-h{font-family:'Baloo 2',system-ui,sans-serif!important;letter-sp
 .nv-sum{color:#e9e6ff;line-height:1.55;font-size:.98rem}
 .chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.78rem;font-weight:800;margin:0 6px 6px 0}
 .chip.pos{background:rgba(61,220,151,.18);color:#3DDC97}.chip.neu{background:rgba(155,140,255,.2);color:#C9C0FF}
-.chip.neg{background:rgba(255,107,107,.2);color:#FF9A9A}.chip.cat{background:rgba(255,201,60,.16);color:#FFC93C}
+.chip.neg{background:rgba(255,107,107,.2);color:#FF9A9A}.chip.cat{background:rgba(255,201,60,.16);color:#FFC93C}.chip.ok{background:rgba(61,220,151,.14);color:#3DDC97}
+.nv-sum ul{margin:6px 0 0 18px;padding:0}.nv-sum li{margin-bottom:5px}
 .trust{height:7px;border-radius:9px;background:rgba(255,255,255,.1);overflow:hidden;margin:2px 0 4px}
 .trust>i{display:block;height:100%;border-radius:9px}
 .nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:14px;margin-bottom:10px}
@@ -991,10 +1457,13 @@ def auth_screen():
         with st.form("login_form"):
             e = st.text_input("Email", key="li_e")
             p = st.text_input("Password", type="password", key="li_p")
+            keep = st.checkbox("Keep me logged in on this device", value=True, key="li_keep")
             if st.form_submit_button("Log in", type="primary", width="stretch"):
                 ok, res = login(e, p)
                 if ok:
                     set_user(res)
+                    if keep:
+                        st.query_params["s"] = create_session(res["id"])
                     st.rerun()
                 else:
                     st.error(res)
@@ -1005,12 +1474,15 @@ def auth_screen():
             p = st.text_input("Password (8+ characters, letters and numbers)", type="password")
             ag = st.selectbox("Age group", ["Under 13", "13 to 17", "18 or older"], index=2)
             c = st.checkbox("A parent or guardian knows about this account and agrees (needed if under 18)")
+            keep = st.checkbox("Keep me logged in on this device", value=True, key="su_keep")
             st.caption("We store your nickname, email, XP and what you save or ask, only to run the app. "
                        "You can delete everything from My Space at any time.")
             if st.form_submit_button("Create my account", type="primary", width="stretch"):
                 ok, res = signup(n, e, p, ag, c)
                 if ok:
                     set_user(q("SELECT * FROM users WHERE id=?", (res,))[0])
+                    if keep:
+                        st.query_params["s"] = create_session(res)
                     st.rerun()
                 else:
                     st.error(res)
@@ -1020,6 +1492,8 @@ def auth_screen():
         if st.button("Start exploring", type="primary", width="stretch"):
             st.session_state.guest = True
             st.session_state.kids_set = kid
+            st.query_params["g"] = "1"
+            st.query_params["k"] = "1" if kid else "0"
             log("guest_start")
             st.rerun()
 
@@ -1043,21 +1517,37 @@ def sidebar():
         st.selectbox("🌐 Translate summaries to", list(LANGS), key="lang")
         if u or st.session_state.get("guest"):
             if st.button("Log out" if u else "Leave guest mode", width="stretch"):
-                for k in ("user", "guest", "articles", "chat", "awarded"):
+                end_session()
+                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev"):
                     st.session_state.pop(k, None)
                 st.rerun()
+        with st.expander("🔧 Check connections"):
+            st.caption("Shows which parts (news, translation, AI, voice) are working.")
+            if st.button("Run check", key="hc_btn"):
+                with st.spinner("Checking..."):
+                    st.session_state.hc = health_check()
+            for name, ok, detail in st.session_state.get("hc", []):
+                st.markdown(f"{ok} **{name}**  \n<small>{esc(detail)}</small>", unsafe_allow_html=True)
         st.divider()
         st.caption("Credibility and sentiment are quick hints, not facts. Always open the source.")
+
+
+def bullets(text, k=3):
+    parts = [p.strip() for p in re.split(r"(?<=[.!?\u0964])\s+", text) if len(p.strip()) > 15]
+    return (parts or [text])[:k]
 
 
 def card_html(a, summary, cat):
     s_label, s_emoji, s_cls = sentiment(a["title"] + ". " + a["text"])
     score, label, color, why = credibility(a)
     img = f'<img class="nv-thumb" src="{esc(a["image"], True)}" alt="" loading="lazy">' if a.get("image") else ""
+    by = f' · ✍️ {esc(a["author"])}' if a.get("author") else ""
+    est = '<span class="chip ok">✅ Established outlet</span>' if a["source"] in OUTLETS or any(t in a["source"].lower() for t in TRUSTED_SOURCES) else ""
+    lis = "".join(f"<li>{esc(b)}</li>" for b in bullets(summary))
     return (f'<div class="nv-card">{img}<h4>{esc(a["title"])}</h4>'
-            f'<div class="nv-meta">{esc(a["source"])} · {esc(time_ago(a["published"]))}</div>'
-            f'<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>'
-            f'<div class="nv-sum">{esc(summary)}</div>'
+            f'<div class="nv-meta">{esc(a["source"])}{by} · {esc(time_ago(a["published"]))}</div>'
+            f'<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>{est}'
+            f'<div class="nv-sum"><ul>{lis}</ul></div>'
             f'<div class="nv-meta" style="margin-top:10px">Credibility hint: <b style="color:{color}">{label} ({score}/100)</b></div>'
             f'<div class="trust"><i style="width:{score}%;background:{color}"></i></div>'
             f'<div class="nv-meta">{esc("; ".join(why[:2]))}</div></div>')
@@ -1066,19 +1556,41 @@ def card_html(a, summary, cat):
 @st.dialog("Story Studio", width="large")
 def studio(a):
     st.markdown(f"#### {esc(a['title'])}")
+    st.caption(f"{a['source']}" + (f" · by {a['author']}" if a.get("author") else "") + f" · {time_ago(a['published'])}")
     if "full" not in a:
-        with st.spinner("Reading the story..."):
+        with st.spinner("Reading the full story..."):
             a["full"] = extract_article(a["url"])
+    full = len(a["full"]) >= 500
+    if full:
+        st.success("✅ Based on the full article text from the publisher.")
+    else:
+        st.warning("⚠️ Only the headline and a short snippet were available, so explanations stay brief instead of guessing. "
+                   "Open the original for the full story.")
     log("studio", a["title"][:80])
     award(3, "read_" + a["url"])
-    modes = ["🧒 Explain simply", "🎨 Cartoon", "🧠 Quiz", "📚 Hard words"]
+    modes = ["📋 2-min briefing", "🎨 Cartoon", "🧒 Explain simply", "🧠 Quiz", "📚 Hard words"]
     mode = st.radio("What would you like?", modes, horizontal=True, key="studio_mode")
     code, voice = LANGS[st.session_state.lang]
     if mode == modes[0]:
-        with st.spinner("Newsie is thinking..."):
-            txt = explain_simply(a)
-        st.write(tr_safe(txt) if code != "en" else txt)
+        with st.spinner("Writing your briefing..."):
+            md, ai, _ = make_briefing(a)
+        if code != "en":
+            with st.spinner("Translating..."):
+                md = translate_markdown(md, code)
+        words = len(re.findall(r"\w+", md))
+        st.caption(f"⏱ About {max(1, round(words / 180))} min read · "
+                   + ("AI-written strictly from the article text" if ai else "Key sentences taken from the article"))
+        st.markdown(md)
+        if st.button("🔊 Listen to this briefing", key="listen_btn"):
+            plain = re.sub(r"[*#_`]", "", md)[:2500]
+            try:
+                st.audio(base64.b64decode(tts_b64(plain, code, "Newsie")), format="audio/mp3")
+            except Exception as e:
+                st.info(f"Audio isn't available for this language right now ({type(e).__name__}).")
+        st.caption("AI can make mistakes. Check the original link for exact details.")
+        award(4, "brief_" + a["url"])
     elif mode == modes[1]:
+        srv = st.toggle("🔊 Clear voice (works for every language)", value=True, key="srv_voice")
         with st.spinner("Drawing your comic..."):
             panels, ai = cartoon_script(a)
             if code != "en":
@@ -1086,19 +1598,36 @@ def studio(a):
                     for p in panels:
                         p["text"] = translate(p["text"], code)
                 except Exception:
-                    st.warning("Translation is busy, so the comic is in English for now.")
-        embed_html(cartoon_html(panels, voice, a["title"]), 600)
+                    alt = llm_translate([p["text"] for p in panels], code)
+                    if alt:
+                        for p, t in zip(panels, alt):
+                            p["text"] = t
+                    else:
+                        st.warning("Translation is not working right now, so the comic is in English.")
+            if srv:
+                try:
+                    for p in panels:
+                        p["audio"] = tts_b64(p["text"], code, p["speaker"])
+                except Exception as e:
+                    for p in panels:
+                        p.pop("audio", None)
+                    st.caption(f"Clear voice isn't available for this language right now ({type(e).__name__}). "
+                               "Using your device's voice instead.")
+        embed_html(cartoon_html(panels, voice, a["title"]), 640)
         award(10, "cartoon_" + a["url"])
-        if not ai:
-            st.caption("Quick comic made from the story text. Add an AI key to get richer, funnier comics.")
+        st.caption("The comic only uses facts from the article text." + ("" if ai or ai_on() else " Add GEMINI_API_KEY in Secrets for richer comics."))
     elif mode == modes[2]:
+        with st.spinner("Newsie is thinking..."):
+            txt = explain_simply(a)
+        st.write(tr_safe(txt))
+    elif mode == modes[3]:
         qk = "quiz_" + hashlib.sha1(a["url"].encode()).hexdigest()[:8]
-        if qk not in st.session_state:
+        if qk not in st.session_state or not st.session_state[qk]:
             with st.spinner("Making questions..."):
                 st.session_state[qk] = make_quiz(a) or []
         quiz = st.session_state[qk]
         if not quiz:
-            st.info("Quiz needs the AI helper, which is off or used up for today. Try the cartoon or hard words.")
+            st.info(ai_status() + " You can still try the briefing, cartoon or hard words.")
         else:
             picks = []
             for i, z in enumerate(quiz):
@@ -1116,30 +1645,31 @@ def studio(a):
                 log("quiz", f"{score}/{len(quiz)}")
                 st.markdown(f"**You scored {score} out of {len(quiz)}!**")
     else:
-        words = hard_words(a["title"] + " " + article_text(a))
         shown = 0
-        for w in words:
+        for w in hard_words(a["title"] + " " + article_text(a)):
             d = define(w)
             if d:
                 st.markdown(d)
                 shown += 1
         if not shown:
             st.info("No tricky words found here, or the dictionary is busy. Try the Ask Newsie page.")
+    st.link_button(f"🔗 Read the original at {a['source']}", a["url"], width="stretch")
 
 
 def page_news():
     kids = st.session_state.kids
     cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
     with st.form("news_form"):
-        c1, c2, c3 = st.columns([3, 2, 2])
-        query = c1.text_input("Search a topic", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
+        query = st.text_input("Search a topic", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
+        c2, c3, c4 = st.columns(3)
         cat = c2.selectbox("Category", cats)
-        n = c3.slider("Stories", 5, 20, 10)
+        source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
+        n = c4.slider("Stories", 5, 20, 10)
         go = st.form_submit_button("🔎 Get news", type="primary", width="stretch")
     first = "articles" not in st.session_state
     if go or first or st.session_state.get("kids_prev") != kids:
         with st.spinner("Fetching fresh stories..."):
-            arts, note = fetch_news(query.strip(), cat, n, kids)
+            arts, note = fetch_news(query.strip(), cat, n, kids, source)
         st.session_state.articles, st.session_state.note = arts, note
         st.session_state.cat = cat
         st.session_state.kids_prev = kids
@@ -1193,8 +1723,7 @@ def keyword_answer(question):
     if best:
         return (f"I found this in today's stories:\n\n**{best['title']}**\n\n{short_summary(best, 300)}\n\n"
                 "_(Add an AI key in settings and I can answer in more detail.)_")
-    return ("I can look up word meanings (try: *define inflation*). For full answers I need the AI helper, "
-            "which isn't available right now.")
+    return ("I can look up word meanings (try: *define inflation*). " + ai_status())
 
 
 def newsie_reply(question):
@@ -1283,6 +1812,7 @@ def page_space():
         ok = st.checkbox("I understand this cannot be undone", key="del_ok")
         if st.button("Delete my account and data", disabled=not ok):
             delete_user_data(u["id"])
+            st.query_params.clear()
             for k in ("user", "guest", "chat", "awarded"):
                 st.session_state.pop(k, None)
             st.rerun()
@@ -1329,7 +1859,7 @@ def page_admin():
                                 (ai_n, "AI calls today"), (f"{(fb['a'] or 0):.1f}★", f"{fb['c']} ratings")]):
         c.markdown(f'<div class="nv-stat"><b>{v}</b>{l}</div>', unsafe_allow_html=True)
     since = (now() - dt.timedelta(days=14)).isoformat()
-    act = df_query("SELECT substr(ts,1,10) day, COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), sid)) users "
+    act = df_query("SELECT substr(ts,1,10) AS day, COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), sid)) AS users "
                    "FROM events WHERE ts>=? GROUP BY day ORDER BY day", (since,))
     st.markdown("#### Daily active people (last 14 days)")
     if not act.empty:
@@ -1340,12 +1870,12 @@ def page_admin():
         st.bar_chart(kinds.set_index("kind"))
     t1, t2, t3, t4 = st.tabs(["Feedback", "Doubts asked", "Users", "Backup and privacy"])
     with t1:
-        f = df_query("SELECT f.ts, COALESCE(u.name,'Guest') name, f.rating, f.category, f.message FROM feedback f "
+        f = df_query("SELECT f.ts, COALESCE(u.name,'Guest') AS name, f.rating, f.category, f.message FROM feedback f "
                      "LEFT JOIN users u ON u.id=f.user_id ORDER BY f.id DESC LIMIT 500")
         st.dataframe(f, hide_index=True, width="stretch")
         st.download_button("Download feedback CSV", f.to_csv(index=False).encode(), "feedback.csv", "text/csv")
     with t2:
-        c = df_query("SELECT c.ts, COALESCE(u.name,'Guest') name, c.question, c.answer FROM chats c "
+        c = df_query("SELECT c.ts, COALESCE(u.name,'Guest') AS name, c.question, c.answer FROM chats c "
                      "LEFT JOIN users u ON u.id=c.user_id ORDER BY c.id DESC LIMIT 500")
         st.dataframe(c, hide_index=True, width="stretch")
         st.download_button("Download doubts CSV", c.to_csv(index=False).encode(), "doubts.csv", "text/csv")
@@ -1354,11 +1884,14 @@ def page_admin():
         st.dataframe(us, hide_index=True, width="stretch")
         st.download_button("Download users CSV", us.to_csv(index=False).encode(), "users.csv", "text/csv")
     with t4:
-        st.write("Streamlit Community Cloud can wipe local files when the app restarts or redeploys. "
-                 "Download a backup regularly, or move to a hosted database (see README).")
-        if os.path.exists(DB_PATH):
-            with open(DB_PATH, "rb") as fh:
-                st.download_button("Download full database backup", fh.read(), "newsverse_backup.db")
+        if using_pg():
+            st.success("✅ Your data is stored in a permanent PostgreSQL database. It survives restarts and redeploys.")
+        else:
+            st.warning("⚠️ Temporary database: Streamlit Cloud erases it on restart. Add DATABASE_URL in Secrets "
+                       "(free Neon database, see instructions) and download a backup below until then.")
+            if os.path.exists(DB_PATH):
+                with open(DB_PATH, "rb") as fh:
+                    st.download_button("Download full database backup", fh.read(), "newsverse_backup.db")
         em = st.text_input("Delete a user's data by email (for privacy requests)")
         if em and st.button("Delete this user's data"):
             r = q("SELECT id FROM users WHERE email=?", (em.strip().lower(),))
@@ -1372,26 +1905,130 @@ def page_admin():
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+def health_check():
+    rows = []
+
+    def t(name, fn):
+        try:
+            rows.append((name, "✅", str(fn())[:90]))
+        except Exception as e:
+            rows.append((name, "❌", f"{type(e).__name__}: {str(e)[:140]}"))
+
+    def ai_test():
+        if not ai_on():
+            raise RuntimeError("No GEMINI_API_KEY / ANTHROPIC_API_KEY found in Secrets")
+        return "replied: " + _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
+
+    def voice_test():
+        from gtts import gTTS
+        gTTS(text="hello", lang="en").write_to_fp(io.BytesIO())
+        return "server voice works"
+
+    t("News feeds", lambda: f"{len(fetch_rss(None, 'Top stories'))} stories from Bing/Google")
+    t("Translation (Hindi)", lambda: _tr("Good morning friends", "hi"))
+    t("Dictionary", lambda: (define("economy") or "no result").split("\n")[0])
+    t("AI helper", ai_test)
+    t("Clear voice (gTTS)", voice_test)
+    return rows
+
+
+def ls_helper(action, token=""):
+    """Best effort: remember the login token in this browser so the person stays logged in next visit."""
+    js = {"save": f"P.localStorage.setItem('nv_s',{json.dumps(token)});",
+          "clear": "P.localStorage.removeItem('nv_s');",
+          "restore": "const t=P.localStorage.getItem('nv_s'),u=new URL(P.location.href);"
+                     "if(t&&!u.searchParams.get('s')&&P.sessionStorage.getItem('nv_try')!==t)"
+                     "{P.sessionStorage.setItem('nv_try',t);u.searchParams.set('s',t);P.location.replace(u.toString());}"}[action]
+    markup = f"<script>try{{const P=window.parent;{js}}}catch(e){{}}</script>"
+    try:
+        components.html(markup, height=0)
+    except Exception:
+        embed_html(markup, 1)
+
+
+def health_check():
+    rows = []
+
+    def t(name, fn):
+        try:
+            rows.append((name, "✅", str(fn())[:110]))
+        except Exception as e:
+            rows.append((name, "❌", f"{type(e).__name__}: {str(e)[:140]}"))
+
+    def ai_test():
+        if not ai_on():
+            raise RuntimeError("No GEMINI_API_KEY / ANTHROPIC_API_KEY found in Secrets")
+        return "replied: " + _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
+
+    def voice_test():
+        from gtts import gTTS
+        gTTS(text="hello", lang="en").write_to_fp(io.BytesIO())
+        return "server voice works"
+
+    def outlets_test():
+        ok, bad = [], []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {nm: ex.submit(fetch_outlet, nm, "Top stories") for nm in OUTLETS}
+            for nm, f in futs.items():
+                try:
+                    (ok if f.result(timeout=10) else bad).append(nm)
+                except Exception:
+                    bad.append(nm)
+        return f"{len(ok)}/{len(OUTLETS)} outlets reachable" + (f" · down: {', '.join(bad)}" if bad else "")
+
+    def db_test():
+        q("SELECT 1 AS ok")
+        return "PostgreSQL (permanent)" if using_pg() else "SQLite (temporary: erased when the app restarts)"
+
+    t("Database", db_test)
+    t("News outlets", outlets_test)
+    t("Translation (Hindi)", lambda: _tr("Good morning friends", "hi"))
+    t("Dictionary", lambda: (define("economy") or "no result").split("\n")[0])
+    t("AI helper", ai_test)
+    t("Clear voice (gTTS)", voice_test)
+    return rows
+
+
 def main():
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        st.error("The database could not be reached. Check DATABASE_URL in Secrets.")
+        st.caption(f"{type(e).__name__}: {str(e)[:200]}")
+        st.stop()
     st.session_state.setdefault("sid", secrets.token_hex(6))
     st.session_state.setdefault("kids", False)
+    st.session_state.setdefault("lang", "English")
+    restore_session()
     if "kids_set" in st.session_state:
         st.session_state.kids = st.session_state.pop("kids_set")
-    st.session_state.setdefault("lang", "English")
     inject_css()
     if "visit_logged" not in st.session_state:
         st.session_state.visit_logged = True
         log("visit")
     sidebar()
     hero()
-    if not st.session_state.get("user") and not st.session_state.get("guest"):
+    user, guest = st.session_state.get("user"), st.session_state.get("guest")
+    tok = st.query_params.get("s")
+    if user and tok and not st.session_state.get("ls_saved"):
+        ls_helper("save", tok)
+        st.session_state.ls_saved = True
+    if not user and not guest:
+        if st.session_state.pop("ls_clear", False):
+            ls_helper("clear")
+        elif not tok:
+            ls_helper("restore")
         auth_screen()
         return
     pages = ["📰 News", "💬 Ask Newsie", "🧭 My Space", "⭐ Rate us"] + (["🛡️ Owner"] if is_admin() else [])
     choice = st.segmented_control("Menu", pages, default=pages[0], key="nav", label_visibility="collapsed") or pages[0]
-    {"📰 News": page_news, "💬 Ask Newsie": page_ask, "🧭 My Space": page_space,
-     "⭐ Rate us": page_feedback, "🛡️ Owner": page_admin}[choice]()
+    fn = {"📰 News": page_news, "💬 Ask Newsie": page_ask, "🧭 My Space": page_space,
+          "⭐ Rate us": page_feedback, "🛡️ Owner": page_admin}[choice]
+    try:
+        fn()
+    except Exception as e:  # never show a blank crash screen
+        st.error("Something went wrong on this page. Tap the menu to try again.")
+        st.caption(f"{type(e).__name__}: {str(e)[:160]}")
 
 
 main()
