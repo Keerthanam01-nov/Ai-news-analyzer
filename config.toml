@@ -1,17 +1,12 @@
+# Put this file in your GitHub repo at:  .streamlit/config.toml
+# It forces ONE bright theme for every visitor, so text is never white-on-cream.
 [theme]
 base = "light"
-primaryColor = "#5B3CFF"
-backgroundColor = "#FFF9F0"
+primaryColor = "#6C4DFF"
+backgroundColor = "#FFFBF2"
 secondaryBackgroundColor = "#F1ECFF"
-textColor = "#1F1B4D"
+textColor = "#1F1B3A"
 font = "sans serif"
-
-[server]
-enableXsrfProtection = true
-maxUploadSize = 5
 
 [client]
 toolbarMode = "minimal"
-
-[browser]
-gatherUsageStats = false
