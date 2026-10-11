@@ -3,15 +3,16 @@ Daily News Buddy - AI News Analyzer for everyone (kids, students, aspirants, adu
 
 Features
 - Live news from BBC, The Hindu, Al Jazeera, Guardian, NPR, NDTV, Indian Express, TOI, HT
-  (last 24 hours first, up to 50 stories, search engines as a backup)
 - Rolling live ticker, quick topic pills, daily mission, WhatsApp sharing
 - Summary, sentiment, credibility hint, translation to Indian languages
-- Story Studio: 2-min briefing, 8-scene cartoon, explain simply, quiz, hard words
-- Newsie chatbot + dictionary, login (PBKDF2), guest mode, XP + streaks
-- Privacy page, ratings, owner dashboard, backups, user data deletion
+- Story Studio: 2-min briefing, cartoon, explain simply, quiz, hard words
+- Newsie chatbot (cartoon / real life / game) + dictionary
+- Login (PBKDF2), forgot password, guest mode, XP + streaks
+- Privacy page, ratings, owner dashboard (visits, feedback), backups, data deletion
 
-Optional Secrets: DATABASE_URL, GEMINI_API_KEY, ADMIN_EMAILS, APP_NAME,
+Secrets: DATABASE_URL (Neon, permanent data), GEMINI_API_KEY, ADMIN_EMAILS, APP_NAME,
 CONTACT_EMAIL, GITHUB_URL, APP_URL, NEWSAPI_KEY
+Optional (password-reset emails): SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM
 """
 import os
 import re
@@ -20,6 +21,7 @@ import base64
 import json
 import time
 import html
+import random
 import socket
 import sqlite3
 import hashlib
@@ -76,15 +78,15 @@ CATEGORIES = {
     "Sports": "SPORTS", "Entertainment": "ENTERTAINMENT",
 }
 KIDS_CATEGORIES = ["Top stories", "Science", "Technology", "Sports", "Entertainment", "World", "Health"]
-CAT_COLOR = {"Top stories": "#FFC93C", "India": "#FF9F43", "Karnataka": "#FF6B6B", "World": "#4DABF7",
-             "Business": "#3DDC97", "Technology": "#9B8CFF", "Science": "#22D3EE", "Health": "#F783AC",
+CAT_COLOR = {"Top stories": "#FFB020", "India": "#FF9F43", "Karnataka": "#FF6B6B", "World": "#4DABF7",
+             "Business": "#3DDC97", "Technology": "#8B6CFF", "Science": "#22D3EE", "Health": "#F783AC",
              "Sports": "#FF8787", "Entertainment": "#E599F7"}
 TOPICS = {"🏏 Cricket": "cricket", "🚀 Space": "ISRO space", "🎬 Movies": "movie film", "🔬 Science": "science",
           "🤖 AI & Tech": "artificial intelligence", "⚽ Football": "football", "📚 Exams": "exam results",
           "🌧️ Weather": "weather rain"}
 TEXT_SIZES = ["Normal", "Large", "Extra large"]
-LEVELS = [(0, "Cub Reporter", "🐣"), (50, "News Explorer", "🧭"), (150, "Story Detective", "🕵️"),
-          (400, "Chief Editor", "👑"), (900, "News Legend", "🌟")]
+LEVELS = [(0, "Reader", "📖"), (50, "Explorer", "🧭"), (150, "Analyst", "🔎"),
+          (400, "Editor", "🖋️"), (900, "Legend", "🌟")]
 
 KIDS_BLOCK = re.compile(
     r"\b(murder|murdered|rape|raped|sex|sexual|porn|suicide|kill|killed|killing|stabbed|shot dead|"
@@ -149,7 +151,7 @@ def iso():
 
 
 # ----------------------------------------------------------------------------
-# Database (SQLite, parameterised queries only)
+# Database (PostgreSQL on Neon when DATABASE_URL is set, otherwise temporary SQLite)
 # ----------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -168,8 +170,14 @@ CREATE TABLE IF NOT EXISTS saved(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, ts TEXT, title TEXT, url TEXT, summary TEXT);
 CREATE TABLE IF NOT EXISTS sessions(
   token_hash TEXT PRIMARY KEY, user_id INTEGER, expires TEXT);
+CREATE TABLE IF NOT EXISTS resets(
+  email TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires TEXT NOT NULL, tries INTEGER DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
+CREATE INDEX IF NOT EXISTS idx_events_sid ON events(sid);
+CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts);
 """
+NO_ID_TABLES = ("INTO SESSIONS", "INTO RESETS")  # these tables have no 'id' column
 
 
 def using_pg():
@@ -230,7 +238,7 @@ def q(sql, params=()):
 def x(sql, params=()):
     if using_pg():
         s2 = sql.replace("?", "%s")
-        ret = s2.lstrip().upper().startswith("INSERT INTO") and "INTO SESSIONS" not in s2.upper()
+        ret = s2.lstrip().upper().startswith("INSERT INTO") and not any(t in s2.upper() for t in NO_ID_TABLES)
         rows = _pg_run(s2 + (" RETURNING id" if ret else ""), params)
         return rows[0]["id"] if ret and rows else None
     with closing(sqlite3.connect(DB_PATH, timeout=15)) as con:
@@ -262,27 +270,34 @@ def is_admin():
     return bool(u and u["email"] in admin_emails())
 
 
+def pw_ok(pw):
+    if len(pw) < 8 or pw.isalpha() or pw.isdigit():
+        return False, "Use a password with 8+ characters, mixing letters and numbers."
+    return True, ""
+
+
 def signup(name, email, pw, age_group, consent):
     name, email = name.strip()[:40], email.strip().lower()
     if len(name) < 2:
         return False, "Please enter a nickname with at least 2 letters."
     if not EMAIL_RE.match(email) or len(email) > 120:
         return False, "That email doesn't look right. Check it and try again."
-    if len(pw) < 8 or pw.isalpha() or pw.isdigit():
-        return False, "Use a password with 8+ characters, mixing letters and numbers."
+    ok, msg = pw_ok(pw)
+    if not ok:
+        return False, msg
     if age_group != "18 or older" and not consent:
         return False, "Please tick the box to confirm a parent or guardian agrees."
     if q("SELECT 1 FROM users WHERE email=?", (email,)):
         return False, "This email is already registered. Log in instead."
     salt = secrets.token_hex(16)
-    uid = x("INSERT INTO users(email,name,salt,pw_hash,age_group,created,last_login) VALUES(?,?,?,?,?,?,?)",
-            (email, name, salt, hash_pw(pw, salt), age_group, iso(), iso()))
-    return True, uid
+    uid_ = x("INSERT INTO users(email,name,salt,pw_hash,age_group,created,last_login) VALUES(?,?,?,?,?,?,?)",
+             (email, name, salt, hash_pw(pw, salt), age_group, iso(), iso()))
+    return True, uid_
 
 
 def login(email, pw):
     email = email.strip().lower()
-    bad = "Wrong email or password. New here? Use the Sign up tab first."
+    bad = "Wrong email or password. New here? Use Sign up. Forgot it? Use the Forgot password tab."
     rows = q("SELECT * FROM users WHERE email=?", (email,))
     if not rows:
         hash_pw(pw, "00" * 16)  # keep timing similar
@@ -299,10 +314,75 @@ def login(email, pw):
     return True, u
 
 
+# ---- Forgot password: 6-digit code by email (SMTP) or generated by the owner ----
+def smtp_ready():
+    return bool(cfg("SMTP_HOST") and cfg("SMTP_USER") and cfg("SMTP_PASSWORD"))
+
+
+def send_email(to, subject, body):
+    import smtplib
+    import ssl
+    from email.message import EmailMessage
+    host, port = cfg("SMTP_HOST"), int(cfg("SMTP_PORT", "587"))
+    msg = EmailMessage()
+    msg["Subject"], msg["To"] = subject, to
+    msg["From"] = cfg("SMTP_FROM") or cfg("SMTP_USER")
+    msg.set_content(body)
+    ctx = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=15) as s:
+            s.login(cfg("SMTP_USER"), cfg("SMTP_PASSWORD"))
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=15) as s:
+            s.starttls(context=ctx)
+            s.login(cfg("SMTP_USER"), cfg("SMTP_PASSWORD"))
+            s.send_message(msg)
+
+
+def create_reset(email):
+    """Makes a one-time 6-digit code (valid 30 minutes). Returns the code, or None if no such account."""
+    email = email.strip().lower()
+    if not q("SELECT 1 FROM users WHERE email=?", (email,)):
+        return None
+    code = f"{secrets.randbelow(10 ** 6):06d}"
+    x("DELETE FROM resets WHERE email=?", (email,))
+    x("INSERT INTO resets(email,code_hash,expires,tries) VALUES(?,?,?,0)",
+      (email, _th(email + ":" + code), (now() + dt.timedelta(minutes=30)).isoformat(timespec="seconds")))
+    return code
+
+
+def finish_reset(email, code, new_pw):
+    email, code = email.strip().lower(), code.strip()
+    ok, msg = pw_ok(new_pw)
+    if not ok:
+        return False, msg
+    bad = "That code is wrong or has expired. Please request a new one."
+    rows = q("SELECT * FROM resets WHERE email=?", (email,))
+    if not rows:
+        return False, bad
+    r = rows[0]
+    if r["expires"] < iso() or (r["tries"] or 0) >= 5:
+        x("DELETE FROM resets WHERE email=?", (email,))
+        return False, bad
+    if not hmac.compare_digest(_th(email + ":" + code), r["code_hash"]):
+        x("UPDATE resets SET tries=tries+1 WHERE email=?", (email,))
+        return False, bad
+    urows = q("SELECT id FROM users WHERE email=?", (email,))
+    if not urows:
+        return False, bad
+    salt = secrets.token_hex(16)
+    x("UPDATE users SET salt=?, pw_hash=?, failed=0, locked_until=NULL WHERE id=?",
+      (salt, hash_pw(new_pw, salt), urows[0]["id"]))
+    x("DELETE FROM sessions WHERE user_id=?", (urows[0]["id"],))
+    x("DELETE FROM resets WHERE email=?", (email,))
+    return True, "Password changed. You can log in now."
+
+
 def set_user(row, kind="login"):
     st.session_state.user = {"id": row["id"], "name": row["name"], "email": row["email"],
                              "age_group": row["age_group"]}
-    st.session_state.kids_set = row["age_group"] != "18 or older"
+    st.session_state.kids_set = row["age_group"] == "Under 13"  # everyone else starts in the normal full mode
     log(kind)
     award(1, "login")
 
@@ -347,15 +427,15 @@ def end_session():
     st.query_params.clear()
 
 
-def delete_user_data(uid):
+def delete_user_data(uid_):
     for t in ("feedback", "chats", "saved", "sessions"):
-        x(f"DELETE FROM {t} WHERE user_id=?", (uid,))
-    x("UPDATE events SET user_id=NULL, detail='' WHERE user_id=?", (uid,))
-    x("DELETE FROM users WHERE id=?", (uid,))
+        x(f"DELETE FROM {t} WHERE user_id=?", (uid_,))
+    x("UPDATE events SET user_id=NULL, detail='' WHERE user_id=?", (uid_,))
+    x("DELETE FROM users WHERE id=?", (uid_,))
 
 
 # ----------------------------------------------------------------------------
-# Events, XP, limits
+# Events, XP, fair-use guard
 # ----------------------------------------------------------------------------
 def uid():
     u = st.session_state.get("user")
@@ -400,15 +480,19 @@ def award(points, key):
 
 
 def ai_allowed():
+    """Only an anti-abuse guard. The limits are so high that normal readers never reach them."""
     if is_admin():
         return True
     today = now().date().isoformat()
-    if uid():
-        n = q("SELECT COUNT(*) c FROM events WHERE kind='ai' AND user_id=? AND substr(ts,1,10)=?", (uid(), today))[0]["c"]
-        return n < int(cfg("AI_DAILY_LIMIT", "30"))
-    n = q("SELECT COUNT(*) c FROM events WHERE kind='ai' AND sid=? AND substr(ts,1,10)=?",
-          (st.session_state.sid, today))[0]["c"]
-    return n < int(cfg("AI_GUEST_LIMIT", "5"))
+    try:
+        if uid():
+            n = q("SELECT COUNT(*) c FROM events WHERE kind='ai' AND user_id=? AND substr(ts,1,10)=?", (uid(), today))[0]["c"]
+            return n < int(cfg("AI_DAILY_LIMIT", "1000"))
+        n = q("SELECT COUNT(*) c FROM events WHERE kind='ai' AND sid=? AND substr(ts,1,10)=?",
+              (st.session_state.sid, today))[0]["c"]
+        return n < int(cfg("AI_GUEST_LIMIT", "300"))
+    except Exception:
+        return True
 
 
 # ----------------------------------------------------------------------------
@@ -524,12 +608,12 @@ def _llm_cached(system, messages_json, max_tokens):
 
 
 def llm(system, messages, max_tokens=700):
-    """Returns text, or None when AI is off / limit reached / call failed."""
+    """Returns text, or None when AI is off / busy / call failed."""
     if not ai_on() or not ai_allowed():
         return None
     try:
         out = _llm_cached(system, json.dumps(messages), max_tokens).strip()
-        log("ai")  # only successful calls count toward the daily limit
+        log("ai")
         st.session_state.pop("ai_err", None)
         return out
     except Exception as e:
@@ -540,14 +624,12 @@ def llm(system, messages, max_tokens=700):
 def ai_status():
     if not ai_on():
         return "The AI helper isn't set up yet. The site owner must add GEMINI_API_KEY in Streamlit Secrets."
-    if not ai_allowed():
-        return "You've used today's AI helpers. They refresh tomorrow."
-    return f"The AI service didn't answer ({st.session_state.get('ai_err', 'unknown reason')}). Please try again in a minute."
+    return "Newsie's AI helper is busy for a moment. Please try again in a few seconds."
 
 
 def audience(kids):
     return "a curious 8-year-old child (very simple words, short sentences, fun tone)" if kids \
-        else "a general reader at Class 10 level (clear, neutral, concise)"
+        else "a general reader of any age (clear, neutral, concise, no jargon)"
 
 
 # ----------------------------------------------------------------------------
@@ -839,7 +921,7 @@ def fetch_news(query, cat, n, kids, source="All trusted media"):
     try:
         return _fetch_live(query, cat, n, kids, source)
     except Exception:
-        return DEMO_ARTICLES[:n], "Live news couldn't be loaded right now, so these are sample stories. Tap Get news to try again."
+        return DEMO_ARTICLES[:n], "Live news couldn't be loaded right now, so these are sample stories. Tap Search to try again."
 
 
 def public_url(url):
@@ -943,7 +1025,7 @@ def credibility(a):
         why.append("Gives details, not only a headline")
     score = max(5, min(95, score))
     label = "Looks reliable" if score >= 70 else "Check other sources" if score >= 45 else "Be careful"
-    color = "#3DDC97" if score >= 70 else "#FFC93C" if score >= 45 else "#FF6B6B"
+    color = "#0E9F6E" if score >= 70 else "#D98E04" if score >= 45 else "#E02424"
     return score, label, color, why
 
 
@@ -1097,9 +1179,9 @@ def define(word):
         return None
 
 
-def hard_words(text, k=4):
+def hard_words(text, k=5):
     seen, out = set(), []
-    for w in re.findall(r"[A-Za-z]{9,}", text):
+    for w in re.findall(r"[A-Za-z]{7,}", text):
         lw = w.lower()
         if lw not in seen:
             seen.add(lw)
@@ -1136,9 +1218,7 @@ def explain_simply(a):
     out = llm(SYSTEM_BASE, [{"role": "user", "content":
         f"Audience: {audience(kids)}.\nExplain this news in 4-5 short sentences, then one line starting "
         f"'Why it matters:'. Do not use bullet points. " + STRICT + f"\nTitle: {a['title']}\nText: {article_text(a, 4500)}"}], 450)
-    if out:
-        return out
-    return short_summary(a, 260) + "\n\n(Tip: the AI helper gives a child-friendly explanation here.)"
+    return out or short_summary(a, 300)
 
 
 def sentences(text, lo=30, hi=420):
@@ -1436,84 +1516,130 @@ def make_quiz(a):
         return None
 
 
+def local_quiz(a):
+    """Works without AI: 'which sentence comes from this story?' using other stories as wrong options."""
+    mine = sentences(article_text(a, 4000), 40, 170)
+    others = [s for b in st.session_state.get("articles", []) if b.get("url") != a.get("url")
+              for s in sentences(b["text"], 40, 170)]
+    if not mine or len(others) < 2:
+        return None
+    rnd = random.Random(a["url"])
+    out = []
+    for s in mine[:3]:
+        opts = [s] + rnd.sample(others, 2)
+        rnd.shuffle(opts)
+        out.append({"q": "Which of these sentences comes from this story?", "options": opts,
+                    "answer": opts.index(s), "why": "It appears in the article."})
+    return out
+
+
 # ----------------------------------------------------------------------------
 # UI: styling and 3D hero
 # ----------------------------------------------------------------------------
 def inject_css(kids=False):
-    accent = "#FF9F1C" if kids else "#FFC93C"
+    accent = "#FF9F1C" if kids else "#FFB020"
     size = {"Normal": "100%", "Large": "112%", "Extra large": "125%"}.get(st.session_state.get("tsize", "Normal"), "100%")
-    page_bg = "linear-gradient(180deg,#FFF3C4 0%,#FFFBF2 320px)" if kids else "#FFFBF2"
+    page_bg = "linear-gradient(180deg,#FFF1C9 0,#F5F6FB 340px)" if kids else "linear-gradient(180deg,#E7E5FF 0,#F5F6FB 380px)"
     css = """
-<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-html{font-size:__SIZE__}
-:root{--ink:#1F1B3A;--muted:#5B5680;--bg:#FFFBF2;--soft:#F1ECFF;--line:#CFC6FF;--sun:__ACCENT__;--brand:#6C4DFF}
-html,body,[class*="css"],.stMarkdown,p,li,label{font-family:'Nunito',system-ui,sans-serif!important}
-h1,h2,h3,h4,.nv-h{font-family:'Baloo 2',system-ui,sans-serif!important}
+html{font-size:__SIZE__;color-scheme:light only}
+:root{--ink:#16143A;--muted:#55527A;--bg:#F5F6FB;--soft:#EEF0FF;--line:#D9DCF2;--brand:#5B3DF5;--brand2:#8B6CFF;--teal:#0FB5A6;--sun:__ACCENT__}
+html,body,.stApp,[data-testid="stMarkdownContainer"],input,textarea,button,label{font-family:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',sans-serif!important}
 .stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:__BG__!important;color:var(--ink)!important}
-[data-testid="stHeader"]{background:transparent!important}
+.block-container{max-width:1120px;padding:.8rem 1rem 4rem}
 [data-testid="stSidebar"],[data-testid="stSidebar"]>div{background:var(--soft)!important}
-.block-container{max-width:1100px;padding:1rem 1rem 4rem}
-.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,.stApp h6{color:var(--ink)!important}
-.stApp .stMarkdown p,.stApp .stMarkdown li,.stApp .stMarkdown span,.stApp label,.stApp [data-testid="stWidgetLabel"] p,
-.stApp [data-testid="stMarkdownContainer"] p{color:var(--ink)!important;opacity:1!important}
-.stApp [data-testid="stCaptionContainer"],.stApp [data-testid="stCaptionContainer"] p{color:var(--muted)!important;opacity:1!important}
-.stApp input,.stApp textarea{color:var(--ink)!important;background:#fff!important;-webkit-text-fill-color:var(--ink)!important}
-.stApp [data-baseweb="select"]>div,.stApp [data-baseweb="input"]>div,.stApp [data-baseweb="textarea"]{background:#fff!important;border-color:var(--line)!important}
-.stApp [data-baseweb="select"] *{color:var(--ink)!important}
-[data-baseweb="popover"] *,[role="listbox"] *{color:var(--ink)!important;background-color:#fff}
+/* top Streamlit bar: Share, GitHub, Stop, menu are always readable */
+html body .stApp [data-testid="stHeader"]{background:rgba(255,255,255,.97)!important;border-bottom:1px solid var(--line);box-shadow:0 1px 8px rgba(40,30,120,.06)}
+html body .stApp [data-testid="stHeader"] *{color:var(--ink)!important;fill:var(--ink)!important}
+/* text */
+.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,.stApp h6{color:var(--ink)!important;letter-spacing:-.01em;font-weight:800}
+.stApp [data-testid="stMarkdownContainer"] p,.stApp [data-testid="stMarkdownContainer"] li,.stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stWidgetLabel"] label,.stApp label p,.stApp label span,.stApp [data-testid="stRadio"] label div{color:var(--ink)!important;opacity:1!important}
+.stApp [data-testid="stCaptionContainer"],.stApp [data-testid="stCaptionContainer"] *{color:var(--muted)!important;opacity:1!important}
+.stApp [data-testid="stAlert"] p,.stApp [data-testid="stAlert"] div,.stApp [data-testid="stAlert"] li{color:var(--ink)!important}
+/* inputs, dropdowns */
+.stApp input,.stApp textarea{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;background:#fff!important;caret-color:var(--brand)}
+.stApp ::placeholder{color:#6B678F!important;opacity:1!important;-webkit-text-fill-color:#6B678F!important}
+.stApp [data-baseweb="select"]>div,.stApp [data-baseweb="input"]>div,.stApp [data-baseweb="textarea"],.stApp [data-baseweb="base-input"]{
+ background:#fff!important;border:1.5px solid var(--line)!important;border-radius:12px!important}
+.stApp [data-baseweb="select"] *{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important}
+.stApp [data-baseweb="select"] svg{fill:var(--ink)!important}
+[data-baseweb="popover"],[data-baseweb="popover"] *,[data-baseweb="menu"],[data-baseweb="menu"] *,[role="listbox"],[role="listbox"] *{color:var(--ink)!important;background-color:#fff!important}
+[role="option"]:hover,[role="option"][aria-selected="true"]{background-color:var(--soft)!important}
+/* chat */
 [data-testid="stBottom"],[data-testid="stBottom"]>div{background:var(--bg)!important}
 [data-testid="stChatInput"]{background:#fff!important;border:2px solid var(--brand)!important;border-radius:16px}
-[data-testid="stChatInput"] textarea{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important}
+[data-testid="stChatInput"] *{color:var(--ink)!important}
+[data-testid="stChatInput"] textarea{-webkit-text-fill-color:var(--ink)!important}
 [data-testid="stChatMessage"]{background:#fff!important;border:1px solid var(--line);border-radius:16px;margin-bottom:8px}
 [data-testid="stExpander"]{background:#fff!important;border:1px solid var(--line)!important;border-radius:14px}
 [data-testid="stExpander"] summary,[data-testid="stExpander"] summary *{color:var(--ink)!important}
-div[role="dialog"]{background:var(--bg)!important;color:var(--ink)!important}
+div[role="dialog"]{background:#fff!important;color:var(--ink)!important}
+[data-testid="stVerticalBlockBorderWrapper"]{border-color:var(--line)!important;border-radius:16px!important;background:#fff}
 .stApp [data-baseweb="tab"] p{color:var(--ink)!important;font-weight:800}
-.stApp .stButton>button,.stApp .stDownloadButton>button,.stApp .stLinkButton a,.stApp [data-testid^="stBaseLinkButton"]{
- background:#fff!important;color:var(--ink)!important;border:2px solid var(--line)!important;border-radius:14px;min-height:44px;font-weight:800;transition:transform .15s ease}
-.stApp .stButton>button *,.stApp .stLinkButton a *,.stApp .stDownloadButton>button *{color:var(--ink)!important}
-.stApp .stButton>button:hover,.stApp .stLinkButton a:hover{transform:translateY(-2px);border-color:var(--brand)!important}
-.stApp [data-testid="stBaseButton-primary"],.stApp [data-testid="stBaseButton-primaryFormSubmit"],.stApp .stFormSubmitButton>button{
- background:var(--sun)!important;border-color:var(--sun)!important;color:#1F1B3A!important}
-.stApp [data-testid="stPills"] button,.stApp [data-testid="stSegmentedControl"] button{background:#fff!important;border:2px solid var(--line)!important}
-.stApp [data-testid="stPills"] button *,.stApp [data-testid="stSegmentedControl"] button *{color:var(--ink)!important}
-.stApp [data-testid="stBaseButton-pillsActive"],.stApp [data-testid="stBaseButton-segmented_controlActive"]{background:var(--brand)!important;border-color:var(--brand)!important}
-.stApp [data-testid="stBaseButton-pillsActive"] *,.stApp [data-testid="stBaseButton-segmented_controlActive"] *{color:#fff!important}
-.nv-card{background:#fff;border:1px solid var(--line);border-top:6px solid var(--cc,#FFC93C);border-radius:20px;padding:16px 18px;margin-bottom:6px;
- box-shadow:0 6px 18px rgba(80,60,160,.10);transition:transform .25s ease,box-shadow .25s ease}
-@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(80,60,160,.18)}}
-.nv-card h4{margin:0 0 6px;font-size:1.15rem;line-height:1.3}
-.nv-meta{color:var(--muted);font-size:.85rem;margin-bottom:8px}
-.nv-sum{color:var(--ink);line-height:1.55;font-size:.98rem}
-.chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.78rem;font-weight:800;margin:0 6px 6px 0}
-.chip.pos{background:#DFF8EC;color:#0B7A55}.chip.neu{background:#ECE8FF;color:#4B35C9}.chip.neg{background:#FFE3E3;color:#B42318}
+.stApp [data-baseweb="tab-highlight"]{background:var(--brand)!important}
+/* buttons */
+html body .stApp .stButton>button,html body .stApp .stDownloadButton>button,html body .stApp [data-testid^="stBaseLinkButton"],
+html body .stApp [data-testid="stBaseButton-secondary"]{background:#fff!important;color:var(--ink)!important;border:1.5px solid var(--line)!important;
+ border-radius:12px!important;min-height:42px;font-weight:700;box-shadow:0 1px 2px rgba(40,30,120,.06);transition:transform .15s ease,border-color .15s ease}
+html body .stApp .stButton>button *,html body .stApp .stDownloadButton>button *,html body .stApp [data-testid^="stBaseLinkButton"] *{color:var(--ink)!important}
+html body .stApp .stButton>button:hover,html body .stApp [data-testid^="stBaseLinkButton"]:hover{border-color:var(--brand)!important;background:var(--soft)!important;transform:translateY(-1px)}
+html body .stApp .stButton>button[data-testid="stBaseButton-primary"],html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-primaryFormSubmit"]{
+ background:linear-gradient(135deg,var(--brand),var(--brand2))!important;border:0!important;color:#fff!important}
+html body .stApp .stButton>button[data-testid="stBaseButton-primary"] *,html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-primaryFormSubmit"] *{color:#fff!important}
+html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"],html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"] *{color:var(--ink)!important;background:#fff!important}
+/* pills and menu */
+html body .stApp [data-testid="stPills"] button,html body .stApp [data-testid="stSegmentedControl"] button{background:#fff!important;border:1.5px solid var(--line)!important;border-radius:99px!important}
+html body .stApp [data-testid="stPills"] button *,html body .stApp [data-testid="stSegmentedControl"] button *{color:var(--ink)!important;opacity:1!important}
+html body .stApp [data-testid="stPills"] button[data-testid="stBaseButton-pillsActive"],
+html body .stApp [data-testid="stSegmentedControl"] button[data-testid="stBaseButton-segmented_controlActive"]{background:var(--brand)!important;border-color:var(--brand)!important}
+html body .stApp [data-testid="stPills"] button[data-testid="stBaseButton-pillsActive"] *,
+html body .stApp [data-testid="stSegmentedControl"] button[data-testid="stBaseButton-segmented_controlActive"] *{color:#fff!important}
+/* brand bar */
+.nv-brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:linear-gradient(120deg,#1B1747 0%,#3B2BB5 60%,#5B3DF5 100%);
+ border-radius:18px;padding:12px 18px;margin:2px 0 10px;box-shadow:0 8px 24px rgba(40,30,140,.22)}
+.nv-brand .logo{width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.16);display:grid;place-items:center;font-size:1.4rem}
+.nv-brand b{color:#fff!important;font-size:1.15rem;display:block;line-height:1.2}
+.nv-brand small{color:#DAD6FF!important;font-size:.8rem}
+.nv-brand .sp{flex:1}
+.nv-brand .live{color:#fff!important;background:rgba(255,255,255,.16);padding:4px 10px;border-radius:99px;font-size:.74rem;font-weight:800}
+.nv-brand .usr{color:#fff!important;background:rgba(255,255,255,.22);padding:5px 12px;border-radius:99px;font-size:.82rem;font-weight:700}
+/* cards */
+.nv-card{background:#fff;border:1px solid var(--line);border-left:6px solid var(--cc,#FFB020);border-radius:18px;padding:16px 18px;margin-bottom:6px;
+ box-shadow:0 4px 16px rgba(60,50,150,.08);transition:transform .22s ease,box-shadow .22s ease}
+@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(60,50,150,.16)}}
+.nv-card h4{margin:0 0 6px;font-size:1.08rem;line-height:1.3;color:var(--ink)!important}
+.nv-meta{color:var(--muted);font-size:.84rem;margin-bottom:8px}
+.nv-sum{color:var(--ink);line-height:1.55;font-size:.95rem}
+.chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.76rem;font-weight:800;margin:0 6px 6px 0}
+.chip.pos{background:#DFF8EC;color:#0B7A55}.chip.neu{background:#E9E6FF;color:#4B35C9}.chip.neg{background:#FFE3E3;color:#B42318}
 .chip.cat{background:#FFF1C2;color:#7A4E00}.chip.ok{background:#DFF8EC;color:#0B7A55}
-.chip.new{background:#FF6B6B;color:#fff;animation:nvpulse 1.6s ease-in-out infinite}
-@keyframes nvpulse{50%{transform:scale(1.08)}}
+.chip.new{background:#E02424;color:#fff;animation:nvpulse 1.6s ease-in-out infinite}
+@keyframes nvpulse{50%{transform:scale(1.07)}}
 .nv-sum ul{margin:6px 0 0 18px;padding:0}.nv-sum li{margin-bottom:5px}
-.trust{height:7px;border-radius:9px;background:#ECE8FF;overflow:hidden;margin:2px 0 4px}
+.trust{height:7px;border-radius:9px;background:#E9E6FF;overflow:hidden;margin:2px 0 4px}
 .trust>i{display:block;height:100%;border-radius:9px}
-.nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:14px;margin-bottom:10px}
-.nv-stat{background:#fff;border-radius:18px;padding:14px 16px;border:1px solid var(--line);color:var(--ink)}
-.nv-stat b{font-family:'Baloo 2';font-size:1.8rem;color:var(--brand);display:block;line-height:1.1}
-.nv-note{background:#ECE8FF;border-left:4px solid var(--brand);border-radius:10px;padding:10px 14px;color:var(--ink);font-size:.92rem}
-.nv-tick{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#ff5e62,#ff9966);border-radius:14px;padding:7px 10px;margin:2px 0 6px;overflow:hidden}
-.nv-tick b{background:#fff;color:#d62828;padding:2px 10px;border-radius:99px;font-size:.8rem;white-space:nowrap}
+.nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:12px;margin-bottom:10px}
+.nv-stat{background:#fff;border-radius:16px;padding:14px 16px;border:1px solid var(--line);color:var(--ink);box-shadow:0 3px 10px rgba(60,50,150,.06)}
+.nv-stat b{font-size:1.7rem;color:var(--brand);display:block;line-height:1.1}
+.nv-note{background:#EEF0FF;border-left:4px solid var(--brand);border-radius:10px;padding:10px 14px;color:var(--ink);font-size:.92rem}
+.nv-tick{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#E02424,#FF7A45);border-radius:14px;padding:7px 10px;margin:2px 0 6px;overflow:hidden}
+.nv-tick b{background:#fff;color:#C81E1E;padding:2px 10px;border-radius:99px;font-size:.78rem;white-space:nowrap}
 .nv-track{overflow:hidden;flex:1}
-.nv-run{display:inline-block;white-space:nowrap;animation:nvrun 160s linear infinite;color:#fff!important;font-weight:800}
+.nv-run{display:inline-block;white-space:nowrap;animation:nvrun 160s linear infinite;color:#fff!important;font-weight:700}
 .nv-run span{color:#fff!important;margin-right:56px}
 .nv-run:hover{animation-play-state:paused}
 @keyframes nvrun{to{transform:translateX(-50%)}}
 @media (prefers-reduced-motion:reduce){.nv-run{animation:none}.nv-track{overflow-x:auto}.nv-card:hover{transform:none}}
-.nv-mission{background:linear-gradient(135deg,#FFF1C2,#FFE0E0);border:2px dashed #F0A500;border-radius:16px;padding:10px 14px;margin:6px 0 4px;font-weight:700;color:var(--ink)}
-.nv-feat{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:6px 0 12px}
-.nv-feat>div{background:#fff;border:1px solid var(--line);border-radius:16px;padding:12px 8px;text-align:center;font-weight:800;color:var(--ink);box-shadow:0 4px 12px rgba(80,60,160,.08)}
-.nv-feat span{display:block;font-size:1.8rem}
-.nv-feat small{display:block;font-weight:600;color:var(--muted);margin-top:2px}
-.nv-foot{text-align:center;margin-top:34px;padding:18px 10px 6px;border-top:1px solid var(--line);font-size:.92rem;line-height:1.8;color:var(--ink)}
+.nv-mission{background:#fff;border:1.5px dashed #F0A500;border-radius:14px;padding:9px 14px;margin:6px 0 8px;font-weight:700;color:var(--ink)}
+.nv-feat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:6px 0 12px}
+.nv-feat>div{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px 8px;text-align:center;font-weight:800;font-size:.9rem;color:var(--ink);box-shadow:0 3px 10px rgba(60,50,150,.06)}
+.nv-feat span{display:block;font-size:1.5rem}
+.nv-feat small{display:block;font-weight:600;color:var(--muted);margin-top:2px;font-size:.76rem}
+.nv-foot{text-align:center;margin-top:34px;padding:18px 10px 6px;border-top:1px solid var(--line);font-size:.9rem;line-height:1.8;color:var(--ink)}
 .nv-foot a{font-weight:800;text-decoration:none;margin:0 6px;color:var(--brand)}
-@media (max-width:640px){.block-container{padding:.6rem .6rem 4rem}.nv-card h4{font-size:1.05rem}}
+@media (max-width:640px){.block-container{padding:.5rem .6rem 4rem}.nv-card h4{font-size:1rem}.nv-brand{padding:10px 12px}}
 </style>"""
     st.markdown(css.replace("__ACCENT__", accent).replace("__SIZE__", size).replace("__BG__", page_bg), unsafe_allow_html=True)
 
@@ -1521,11 +1647,11 @@ div[role="dialog"]{background:var(--bg)!important;color:var(--ink)!important}
 HERO_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@600&display=swap" rel="stylesheet">
 <style>
-html,body{margin:0;height:100%;background:radial-gradient(120% 120% at 70% 40%,#2a2f7a 0%,#12153e 55%,#0b0d28 100%);overflow:hidden;font-family:Nunito,sans-serif}
+html,body{margin:0;height:100%;background:radial-gradient(120% 120% at 70% 40%,#2a2f7a 0%,#12153e 55%,#0b0d28 100%);overflow:hidden;font-family:Nunito,sans-serif;border-radius:18px}
 canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:pan-y}
 .t{position:absolute;left:22px;top:18px;right:22px;pointer-events:none;color:#F6F4FF}
-.t h1{font:800 clamp(26px,5.5vw,46px)/1.05 'Baloo 2',sans-serif;margin:0;text-shadow:0 4px 0 #5b3cff}
-.t p{margin:6px 0 0;font-size:clamp(13px,2.4vw,17px);color:#cfcaff;max-width:30ch}
+.t h1{font:800 clamp(24px,5vw,42px)/1.05 'Baloo 2',sans-serif;margin:0;text-shadow:0 4px 0 #5b3cff}
+.t p{margin:6px 0 0;font-size:clamp(13px,2.3vw,16px);color:#cfcaff;max-width:30ch}
 .nogl .t{position:static;padding:30px}
 </style></head><body>
 <canvas id="c" aria-hidden="true"></canvas>
@@ -1569,11 +1695,11 @@ frame();
 </script></body></html>"""
 
 
-def hero():
+def hero(height=260):
     arts = st.session_state.get("articles") or DEMO_ARTICLES
     heads = [a["title"][:70] for a in arts[:7]]
     payload = json.dumps(heads).replace("</", "<\\/")
-    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__APPNAME__", esc(APP_NAME)), 300)
+    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__APPNAME__", esc(APP_NAME)), height)
 
 
 def ticker_html(arts):
@@ -1582,7 +1708,7 @@ def ticker_html(arts):
 
 
 def mission_card():
-    """Daily mission: 3 small goals that keep kids (and adults) coming back."""
+    """Daily mission: 3 small goals that keep readers coming back."""
     today = now().astimezone(IST).date().isoformat()
     m = st.session_state.get("mission")
     if not m or m.get("day") != today:
@@ -1639,7 +1765,7 @@ def privacy_md():
 - Your **nickname, email and age group** (so you can log in and so we know whether Kids Mode is right).
 - Your **password only as a salted hash** (PBKDF2). Nobody, including the owner, can read your real password.
 - Your **XP, streak, saved stories, questions you ask Newsie, and ratings** you send.
-- **Simple usage events** such as "opened a story", with a random visitor ID. We do **not** store your IP address, phone number, address or location.
+- **Simple usage events** such as "opened a story", with a random visitor ID, used only to count visits. We do **not** store your IP address, phone number, address or location.
 
 #### Where it is stored and who can see it
 - In a **PostgreSQL database on Neon**, reached over an encrypted connection. The app itself runs on Streamlit Community Cloud.
@@ -1677,11 +1803,11 @@ def page_privacy():
 
 
 # ----------------------------------------------------------------------------
-# Pages
+# Shared UI pieces
 # ----------------------------------------------------------------------------
 FEATURES = [("📋", "2-min briefing", "Any story in bullet points"), ("🎨", "Cartoons", "Newsie and Kiki act out the news"),
             ("🌐", "14 languages", "Read and listen in yours"), ("🧠", "Quiz and XP", "Learn, earn streak badges"),
-            ("💬", "Ask Newsie", "Answers as cartoon, real life or game"), ("🎧", "Clear voice", "Hear stories read aloud")]
+            ("💬", "Ask Newsie", "Cartoon, real life or game"), ("🎧", "Clear voice", "Hear stories read aloud")]
 
 
 def features_html():
@@ -1689,12 +1815,38 @@ def features_html():
     return f'<div class="nv-feat">{tiles}</div>'
 
 
+def brand_bar():
+    u = st.session_state.get("user")
+    chip = ""
+    if u:
+        row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))
+        if row:
+            (lo, name, icon), _ = level_of(row[0]["xp"])
+            chip = f'<span class="usr">{icon} {esc(u["name"])} · {row[0]["xp"]} XP · 🔥 {row[0]["streak"]}</span>'
+    elif st.session_state.get("guest"):
+        chip = '<span class="usr">👤 Guest</span>'
+    st.markdown(f'<div class="nv-brand"><div class="logo">📰</div><div><b>{esc(APP_NAME)}</b>'
+                f'<small>Understand any news, in your language, at your level</small></div>'
+                f'<div class="sp"></div><span class="live">● LIVE</span>{chip}</div>', unsafe_allow_html=True)
+
+
+def do_logout():
+    end_session()
+    for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev", "mission", "last_page"):
+        st.session_state.pop(k, None)
+
+
 def top_bar():
-    """Always-visible controls (no hunting in menus). Choices are remembered in the page address."""
-    c1, c2, c3 = st.columns([3, 2, 3])
-    c1.selectbox("🌐 Language", list(LANGS), key="lang")
-    c2.selectbox("🔠 Text size", TEXT_SIZES, key="tsize")
-    c3.toggle("🧸 Kids Mode (safe stories, simple words)", key="kids")
+    """One tidy row of controls. Choices are remembered in the page address."""
+    signed = st.session_state.get("user") or st.session_state.get("guest")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.7, 1.1], vertical_alignment="bottom")
+        c1.selectbox("🌐 Language", list(LANGS), key="lang")
+        c2.selectbox("🔠 Text size", TEXT_SIZES, key="tsize")
+        c3.toggle("🧸 Kids Mode", key="kids", help="Safer stories and simpler words. Turn it off for the full news experience.")
+        if signed and c4.button("Log out" if st.session_state.get("user") else "Exit guest", key="top_logout", width="stretch"):
+            do_logout()
+            st.rerun()
     try:
         code = LANGS[st.session_state.lang][0]
         if st.query_params.get("l") != code:
@@ -1722,8 +1874,8 @@ def auth_screen():
         embed_html(cartoon_html(WELCOME_PANELS, "en-IN", f"Welcome to {APP_NAME}"), 640)
     with right:
         st.markdown(f"### Join {esc(APP_NAME)}")
-        st.caption("Log in to save stories, earn XP and keep your streak. Guests can explore with fewer AI helpers.")
-        t1, t2, t3 = st.tabs(["Log in", "Sign up", "Just explore"])
+        st.caption("Log in to save stories, earn XP and keep your streak. Guests get every feature too.")
+        t1, t2, t3, t4 = st.tabs(["Log in", "Sign up", "Forgot password", "Explore"])
         with t1:
             with st.form("login_form"):
                 e = st.text_input("Email", key="li_e")
@@ -1758,7 +1910,33 @@ def auth_screen():
                     else:
                         st.error(res)
         with t3:
-            st.write("No account needed. You can read news, see sentiment and credibility hints, and try 5 AI helpers a day.")
+            if smtp_ready():
+                st.caption("Step 1: we email you a 6-digit code. Step 2: enter it with a new password.")
+            else:
+                st.caption(f"Step 1: ask the site owner at {contact_email()} for a reset code. "
+                           "Step 2: enter the code with a new password.")
+            if smtp_ready():
+                with st.form("fp_req"):
+                    fe = st.text_input("Your account email", key="fp_e")
+                    if st.form_submit_button("Email me a reset code", width="stretch"):
+                        code = create_reset(fe)
+                        try:
+                            if code:
+                                send_email(fe.strip().lower(), f"{APP_NAME} password reset code",
+                                           f"Your {APP_NAME} reset code is {code}. It works for 30 minutes.\n"
+                                           "If you did not ask for this, ignore this email.")
+                            st.success("If that email is registered, a code is on its way (valid 30 minutes). Check spam too.")
+                        except Exception:
+                            st.error("We couldn't send the email right now. Please contact the site owner.")
+            with st.form("fp_set"):
+                e2 = st.text_input("Account email", key="fp_e2")
+                code2 = st.text_input("6-digit reset code", max_chars=6, key="fp_c")
+                np_ = st.text_input("New password (8+ characters, letters and numbers)", type="password", key="fp_p")
+                if st.form_submit_button("Set new password", type="primary", width="stretch"):
+                    ok, msg = finish_reset(e2, code2, np_)
+                    (st.success if ok else st.error)(msg)
+        with t4:
+            st.write("No account needed. Read news, see sentiment and credibility hints, and use every Story Studio tool.")
             kid = st.toggle("I'm a kid (turn on Kids Mode)", value=False, key="guest_kid")
             if st.button("Start exploring", type="primary", width="stretch"):
                 st.session_state.guest = True
@@ -1786,12 +1964,6 @@ def sidebar():
             st.caption(f"🔥 {row['streak']}-day streak")
         elif st.session_state.get("guest"):
             st.caption("Exploring as guest")
-        if u or st.session_state.get("guest"):
-            if st.button("Log out" if u else "Leave guest mode", width="stretch"):
-                end_session()
-                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev", "mission"):
-                    st.session_state.pop(k, None)
-                st.rerun()
         with st.expander("🔧 Check connections"):
             st.caption("Shows which parts (news, translation, AI, voice) are working.")
             if st.button("Run check", key="hc_btn"):
@@ -1803,6 +1975,9 @@ def sidebar():
         st.caption("Credibility and sentiment are quick hints, not facts. Always open the source.")
 
 
+# ----------------------------------------------------------------------------
+# Pages
+# ----------------------------------------------------------------------------
 def bullets(text, k=3):
     parts = [p.strip() for p in re.split(r"(?<=[.!?\u0964])\s+", text) if len(p.strip()) > 15]
     return (parts or [text])[:k]
@@ -1816,7 +1991,7 @@ def card_html(a, summary, cat):
     est = '<span class="chip ok">✅ Established outlet</span>' if a["source"] in OUTLETS or any(t in a["source"].lower() for t in TRUSTED_SOURCES) else ""
     fresh = '<span class="chip new">🆕 Fresh</span>' if a.get("published") and 0 <= (now() - a["published"]).total_seconds() < 10800 else ""
     lis = "".join(f"<li>{esc(b)}</li>" for b in bullets(summary))
-    return (f'<div class="nv-card" style="--cc:{CAT_COLOR.get(cat, "#FFC93C")}">{img}<h4>{esc(a["title"])}</h4>'
+    return (f'<div class="nv-card" style="--cc:{CAT_COLOR.get(cat, "#FFB020")}">{img}<h4>{esc(a["title"])}</h4>'
             f'<div class="nv-meta">{esc(a["source"])}{by} · {esc(time_ago(a["published"]))}</div>'
             f'{fresh}<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>{est}'
             f'<div class="nv-sum"><ul>{lis}</ul></div>'
@@ -1839,10 +2014,9 @@ def studio(a):
             a["full"] = extract_article(a["url"])
     full = len(a["full"]) >= 500
     if full:
-        st.success("✅ Based on the full article text from the publisher.")
+        st.caption("✅ Based on the full article text from the publisher.")
     else:
-        st.warning("⚠️ Only the headline and a short snippet were available, so explanations stay brief instead of guessing. "
-                   "Open the original for the full story.")
+        st.caption("ℹ️ Based on the headline and preview text. Open the original link for the full story.")
     log("studio", a["title"][:80])
     award(3, "read_" + a["url"])
     st.session_state.get("mission", {}).get("read", set()).add(a["url"])
@@ -1904,10 +2078,13 @@ def studio(a):
         qk = "quiz_" + hashlib.sha1(a["url"].encode()).hexdigest()[:8]
         if qk not in st.session_state or not st.session_state[qk]:
             with st.spinner("Making questions..."):
-                st.session_state[qk] = make_quiz(a) or []
+                st.session_state[qk] = make_quiz(a) or local_quiz(a) or []
         quiz = st.session_state[qk]
         if not quiz:
-            st.info(ai_status() + " You can still try the briefing, cartoon or hard words.")
+            st.info("The quiz maker needs a moment. Please try again.")
+            if st.button("🔄 Try again", key=qk + "_retry"):
+                st.session_state.pop(qk, None)
+                st.rerun(scope="fragment")
         else:
             picks = []
             for i, z in enumerate(quiz):
@@ -1934,24 +2111,31 @@ def studio(a):
                 st.markdown(d)
                 shown += 1
         if not shown:
-            st.info("No tricky words found here, or the dictionary is busy. Try the Ask Newsie page.")
+            st.caption("No difficult words were spotted in this story. You can look up any word below.")
+        lookup = st.text_input("📖 Look up any word", key="hw_lookup", placeholder="e.g. inflation")
+        if lookup.strip():
+            d = define(lookup.strip().split()[0])
+            st.markdown(d if d else "That word wasn't found. Check the spelling and try again.")
     st.link_button(f"🔗 Read the original at {a['source']}", a["url"], width="stretch")
 
 
 def page_news():
     kids = st.session_state.kids
     cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
+    hero(190)
     st.markdown(features_html(), unsafe_allow_html=True)
     tick_ph = st.container()
     mission_card()
     topic = st.pills("⚡ Quick topics", list(TOPICS), key="topic_pill", label_visibility="collapsed")
     with st.form("news_form"):
-        query = st.text_input("Search a topic", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
-        c2, c3, c4 = st.columns(3)
-        cat = c2.selectbox("Category", cats)
-        source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
-        n = c4.slider("Stories", 10, MAX_STORIES, 30)
-        go = st.form_submit_button("🔎 Get fresh news", type="primary", width="stretch")
+        c1, c2 = st.columns([5, 1.4], vertical_alignment="bottom")
+        query = c1.text_input("Search the news", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
+        go = c2.form_submit_button("🔎 Search", type="primary", width="stretch")
+        with st.expander("More filters"):
+            f1, f2, f3 = st.columns(3)
+            cat = f1.selectbox("Category", cats)
+            source = f2.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
+            n = f3.slider("Stories", 10, MAX_STORIES, 30)
     topic_changed = topic != st.session_state.get("last_topic")
     st.session_state.last_topic = topic
     first = "articles" not in st.session_state
@@ -1976,8 +2160,8 @@ def page_news():
     if st.session_state.get("note"):
         (st.info if live else st.warning)(st.session_state.note)
     if kids:
-        st.markdown('<div class="nv-note">🧸 Kids Mode is on: gentle stories only, simple explanations and comics.</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="nv-note">🧸 Kids Mode is on: gentle stories only, simple explanations and comics. '
+                    'Switch it off at the top for the full news.</div>', unsafe_allow_html=True)
     code = LANGS[st.session_state.lang][0]
     shown = st.session_state.setdefault("shown", 12)
     view = arts[:shown]
@@ -2026,7 +2210,7 @@ def keyword_answer(question):
             best, score = a, sc
     if best:
         return (f"I found this in today's stories:\n\n**{best['title']}**\n\n{short_summary(best, 300)}\n\n"
-                "_(Add an AI key in settings and I can answer in more detail.)_")
+                "_(Ask again in a moment for a fuller explanation.)_")
     return ("I can look up word meanings (try: *define inflation*). " + ai_status())
 
 
@@ -2084,8 +2268,6 @@ def newsie_answer(question, style):
                 return {"content": d}
     if not ai_enabled():
         return {"content": keyword_answer(question)}
-    if not ai_allowed():
-        return {"content": "You've used all your AI helpers for today. They refresh tomorrow."}
     heads = "\n".join("- " + a["title"] for a in st.session_state.get("articles", [])[:8])
     ctx = f"{GROUND} You are chatting with {audience(kids)}. Today's headlines on screen (context only):\n{heads}"
     if style == "cartoon":
@@ -2234,7 +2416,7 @@ def page_feedback():
                 st.success("Thank you! Your feedback helps us improve.")
     avg = q("SELECT AVG(rating) a, COUNT(*) c FROM feedback")[0]
     if avg["c"]:
-        st.markdown(f"**Community rating: {avg['a']:.1f} / 5** from {avg['c']} reviews")
+        st.markdown(f"**Community rating: {float(avg['a']):.1f} / 5** from {avg['c']} reviews")
     for r in q("SELECT display_name,rating,message FROM feedback WHERE public=1 ORDER BY id DESC LIMIT 5"):
         st.markdown(f"{'⭐' * r['rating']} **{esc(r['display_name'])}**: {esc(r['message'])}")
 
@@ -2244,31 +2426,40 @@ def page_admin():
         st.error("This page is for the site owner only.")
         return
     st.markdown("### 🛡️ Owner dashboard")
-    st.info("📍 Data is stored in: " + ("PostgreSQL on Neon (permanent)" if using_pg() else "SQLite (TEMPORARY, erased on restart, add DATABASE_URL)"))
+    if using_pg():
+        st.success("📍 Data is stored in PostgreSQL on Neon (permanent). It survives restarts and redeploys.")
+    else:
+        st.error("📍 Data is stored in SQLite, which is TEMPORARY and erased on every restart. "
+                 "Add DATABASE_URL (free Neon database) in Secrets to keep users, visits and feedback.")
     today = now().date().isoformat()
     users = q("SELECT COUNT(*) c FROM users")[0]["c"]
-    guests = q("SELECT COUNT(DISTINCT sid) c FROM events WHERE user_id IS NULL")[0]["c"]
     dau = q("SELECT COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), sid)) c FROM events WHERE substr(ts,1,10)=?", (today,))[0]["c"]
     ai_n = q("SELECT COUNT(*) c FROM events WHERE kind='ai' AND substr(ts,1,10)=?", (today,))[0]["c"]
     fb = q("SELECT AVG(rating) a, COUNT(*) c FROM feedback")[0]
     visits_all = q("SELECT COUNT(*) c FROM events WHERE kind='visit'")[0]["c"]
+    uniq = q("SELECT COUNT(DISTINCT sid) c FROM events WHERE kind='visit'")[0]["c"]
     visits_today = q("SELECT COUNT(*) c FROM events WHERE kind='visit' AND substr(ts,1,10)=?", (today,))[0]["c"]
-    cols = st.columns(6)
-    for c, (v, l) in zip(cols, [(users, "registered users"), (visits_all, "total visits"), (visits_today, "visits today"),
-                                (dau, "active today"), (ai_n, "AI calls today"),
-                                (f"{(fb['a'] or 0):.1f}★", f"{fb['c']} ratings")]):
-        c.markdown(f'<div class="nv-stat"><b>{v}</b>{l}</div>', unsafe_allow_html=True)
+    avg_txt = f"{float(fb['a'] or 0):.1f}★"
+    row1 = [(visits_all, "total visits"), (visits_today, "visits today"), (uniq, "unique sessions"), (users, "registered users")]
+    row2 = [(dau, "active today"), (ai_n, "AI calls today"), (avg_txt, "average rating"), (fb["c"], "feedback entries")]
+    for row in (row1, row2):
+        for c, (v, l) in zip(st.columns(4), row):
+            c.markdown(f'<div class="nv-stat"><b>{v}</b>{l}</div>', unsafe_allow_html=True)
     since = (now() - dt.timedelta(days=14)).isoformat()
+    vis = df_query("SELECT substr(ts,1,10) AS day, COUNT(*) AS visits FROM events WHERE kind='visit' AND ts>=? GROUP BY day ORDER BY day", (since,))
+    st.markdown("#### Visits per day (last 14 days)")
+    if not vis.empty:
+        st.bar_chart(vis.set_index("day"))
     act = df_query("SELECT substr(ts,1,10) AS day, COUNT(DISTINCT COALESCE(CAST(user_id AS TEXT), sid)) AS users "
                    "FROM events WHERE ts>=? GROUP BY day ORDER BY day", (since,))
-    st.markdown("#### Daily active people (last 14 days)")
+    st.markdown("#### Daily active people")
     if not act.empty:
         st.line_chart(act.set_index("day"))
     kinds = df_query("SELECT kind, COUNT(*) n FROM events GROUP BY kind ORDER BY n DESC")
     st.markdown("#### What people use")
     if not kinds.empty:
         st.bar_chart(kinds.set_index("kind"))
-    t1, t2, t3, t4 = st.tabs(["Feedback", "Doubts asked", "Users", "Backup and privacy"])
+    t1, t2, t3, t4, t5 = st.tabs(["Feedback", "Doubts asked", "Users", "Password reset", "Backup and privacy"])
     with t1:
         f = df_query("SELECT f.ts, COALESCE(u.name,'Guest') AS name, f.rating, f.category, f.message FROM feedback f "
                      "LEFT JOIN users u ON u.id=f.user_id ORDER BY f.id DESC LIMIT 500")
@@ -2284,19 +2475,31 @@ def page_admin():
         st.dataframe(us, hide_index=True, width="stretch")
         st.download_button("Download users CSV", us.to_csv(index=False).encode(), "users.csv", "text/csv")
     with t4:
+        st.write("If someone forgot their password and email sending isn't set up, generate a one-time code here "
+                 "and send it to them privately. It works for 30 minutes.")
+        em = st.text_input("User's account email", key="adm_reset_email")
+        if st.button("Generate reset code", key="adm_reset_btn"):
+            code = create_reset(em)
+            if code:
+                st.success("Send this code to the user (it will not be shown again):")
+                st.code(code)
+            else:
+                st.warning("No account found with that email.")
+    with t5:
         if using_pg():
-            st.success("✅ Your data is stored in a permanent PostgreSQL database. It survives restarts and redeploys.")
+            st.success("✅ Your data is stored in a permanent PostgreSQL database.")
         else:
-            st.warning("⚠️ Temporary database: Streamlit Cloud erases it on restart. Add DATABASE_URL in Secrets "
-                       "(free Neon database) and download a backup below until then.")
+            st.warning("⚠️ Temporary database. Add DATABASE_URL in Secrets and download a backup below until then.")
             if os.path.exists(DB_PATH):
                 with open(DB_PATH, "rb") as fh:
                     st.download_button("Download full database backup", fh.read(), "app_backup.db")
         if not cfg("GITHUB_URL"):
             st.info("Footer tip: add GITHUB_URL = \"https://github.com/yourname/yourrepo\" in Secrets to show your GitHub link.")
-        em = st.text_input("Delete a user's data by email (for privacy requests)")
-        if em and st.button("Delete this user's data"):
-            r = q("SELECT id FROM users WHERE email=?", (em.strip().lower(),))
+        if not smtp_ready():
+            st.info("Optional: add SMTP_HOST, SMTP_USER, SMTP_PASSWORD in Secrets so reset codes are emailed automatically.")
+        em2 = st.text_input("Delete a user's data by email (for privacy requests)", key="adm_del_email")
+        if em2 and st.button("Delete this user's data"):
+            r = q("SELECT id FROM users WHERE email=?", (em2.strip().lower(),))
             if r:
                 delete_user_data(r[0]["id"])
                 st.success("Deleted.")
@@ -2387,7 +2590,7 @@ def main():
         st.session_state.visit_logged = True
         log("visit")
     sidebar()
-    hero()
+    brand_bar()
     top_bar()
     user, guest = st.session_state.get("user"), st.session_state.get("guest")
     tok = st.query_params.get("s")
@@ -2399,11 +2602,15 @@ def main():
             ls_helper("clear")
         elif not tok:
             ls_helper("restore")
+        hero(260)
         auth_screen()
         footer()
         return
     pages = ["📰 News", "💬 Ask Newsie", "🧭 My Space", "⭐ Rate us", "🔒 Privacy"] + (["🛡️ Owner"] if is_admin() else [])
     choice = st.segmented_control("Menu", pages, default=pages[0], key="nav", label_visibility="collapsed") or pages[0]
+    if st.session_state.get("last_page") != choice:
+        st.session_state.last_page = choice
+        log("page", choice)
     fn = {"📰 News": page_news, "💬 Ask Newsie": page_ask, "🧭 My Space": page_space,
           "⭐ Rate us": page_feedback, "🔒 Privacy": page_privacy, "🛡️ Owner": page_admin}[choice]
     try:
