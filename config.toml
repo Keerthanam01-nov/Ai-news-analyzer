@@ -1,11 +1,11 @@
 # Put this file in GitHub at:  .streamlit/config.toml
-# It forces ONE bright theme for every visitor, so text is never white-on-light.
+# Forces ONE dark theme for every visitor, so every widget is readable.
 [theme]
-base = "light"
-primaryColor = "#5B3DF5"
-backgroundColor = "#F5F6FB"
-secondaryBackgroundColor = "#EEF0FF"
-textColor = "#d6d5e3"
+base = "dark"
+primaryColor = "#FF5C5C"
+backgroundColor = "#0E1020"
+secondaryBackgroundColor = "#1A1D33"
+textColor = "#F2F3FA"
 font = "sans serif"
 
 [client]
