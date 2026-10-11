@@ -1,9 +1,10 @@
 [theme]
-base = "dark"
-primaryColor = "#FFC93C"
-backgroundColor = "#0F1230"
-secondaryBackgroundColor = "#1A1E4A"
-textColor = "#F6F4FF"
+base = "light"
+primaryColor = "#5B3CFF"
+backgroundColor = "#FFF9F0"
+secondaryBackgroundColor = "#F1ECFF"
+textColor = "#1F1B4D"
+font = "sans serif"
 
 [server]
 enableXsrfProtection = true
