@@ -1,17 +1,13 @@
 """
-Daily News Buddy - AI News Analyzer for everyone (kids, students, aspirants, adults)
+NewsVerse - AI News Analyzer for everyone (kids, students, aspirants, adults)
 
 Features
-- Live news from BBC, The Hindu, Al Jazeera, Guardian, NPR, NDTV, Indian Express, TOI, HT
-  (last 24 hours first, up to 50 stories, search engines as a backup)
-- Rolling live ticker, quick topic pills, daily mission, WhatsApp sharing
-- Summary, sentiment, credibility hint, translation to Indian languages
-- Story Studio: 2-min briefing, 8-scene cartoon, explain simply, quiz, hard words
-- Newsie chatbot + dictionary, login (PBKDF2), guest mode, XP + streaks
-- Privacy page, ratings, owner dashboard, backups, user data deletion
-
-Optional Secrets: DATABASE_URL, GEMINI_API_KEY, ADMIN_EMAILS, APP_NAME,
-CONTACT_EMAIL, GITHUB_URL, APP_URL, NEWSAPI_KEY
+- Live news (NewsAPI if key set, otherwise free Bing / Google News RSS)
+- Summary, sentiment, credibility hint, translation to 11 Indian languages
+- Story Studio: explain simply, 4-panel cartoon, quiz, hard-words dictionary
+- Newsie chatbot + dictionary
+- Login / sign-up (PBKDF2 hashed passwords), guest mode, XP + streaks
+- Ratings & feedback, admin dashboard, backups, user data deletion
 """
 import os
 import re
@@ -38,7 +34,9 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
 def cfg(name, default=""):
     """Read a setting from Streamlit secrets first, then environment variables."""
     try:
@@ -48,18 +46,12 @@ def cfg(name, default=""):
     return str(v) if v not in (None, "") else os.getenv(name, default)
 
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
-APP_NAME = cfg("APP_NAME", "Daily News Buddy")  # change the name any time in Secrets: APP_NAME = "..."
+APP_NAME = cfg("APP_NAME", "NewsBuddy")
+TAGLINE = "News made easy for everyone"
 DB_PATH = os.getenv("NEWSVERSE_DB", "data/newsverse.db")
-UA = {"User-Agent": "Mozilla/5.0 (DailyNewsBuddy learning app)"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 esc = html.escape
-BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0 Safari/537.36",
-              "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}
-IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
-MAX_STORIES = 50
 
 LANGS = {
     "English": ("en", "en-IN"), "Hindi (हिन्दी)": ("hi", "hi-IN"),
@@ -76,12 +68,6 @@ CATEGORIES = {
     "Sports": "SPORTS", "Entertainment": "ENTERTAINMENT",
 }
 KIDS_CATEGORIES = ["Top stories", "Science", "Technology", "Sports", "Entertainment", "World", "Health"]
-CAT_COLOR = {"Top stories": "#FFC93C", "India": "#FF9F43", "Karnataka": "#FF6B6B", "World": "#4DABF7",
-             "Business": "#3DDC97", "Technology": "#9B8CFF", "Science": "#22D3EE", "Health": "#F783AC",
-             "Sports": "#FF8787", "Entertainment": "#E599F7"}
-TOPICS = {"🏏 Cricket": "cricket", "🚀 Space": "ISRO space", "🎬 Movies": "movie film", "🔬 Science": "science",
-          "🤖 AI & Tech": "artificial intelligence", "⚽ Football": "football", "📚 Exams": "exam results",
-          "🌧️ Weather": "weather rain"}
 LEVELS = [(0, "Cub Reporter", "🐣"), (50, "News Explorer", "🧭"), (150, "Story Detective", "🕵️"),
           (400, "Chief Editor", "👑"), (900, "News Legend", "🌟")]
 
@@ -95,8 +81,8 @@ TRUSTED_SOURCES = [
     "times of india", "deccan herald", "livemint", "mint", "economic times", "business standard",
     "al jazeera", "associated press", "ap news", "bloomberg", "theprint", "the print", "scroll",
     "the wire", "firstpost", "india today", "news18", "dd news", "prasar bharati", "isro", "who",
-    "bbc news", "npr", "the indian express", "nature", "science", "financial express", "the guardian",
-    "new york times", "washington post",
+    "bbc news", "npr", "ndtv", "hindustan times", "the indian express", "times of india", "the hindu", "al jazeera",
+    "nature", "science", "financial express", "the guardian", "new york times", "washington post",
 ]
 CLICKBAIT = ["shocking", "you won't believe", "miracle", "secret", "exposed", "bombshell", "slams",
              "destroys", "goes viral", "must watch", "unbelievable", "100% cure", "what happens next",
@@ -127,7 +113,7 @@ DEMO_ARTICLES = [
      "text": "A team of Class 9 students built a purifier using sand, charcoal and clay. Judges praised the design because it costs very little. The students plan to install it in nearby villages."},
 ]
 
-st.set_page_config(page_title=f"{APP_NAME} - understand the news", page_icon="📰",
+st.set_page_config(page_title=f"{APP_NAME} - {TAGLINE}", page_icon="🦉",
                    layout="wide", initial_sidebar_state="collapsed")
 
 
@@ -411,7 +397,7 @@ def ai_allowed():
 
 
 # ----------------------------------------------------------------------------
-# AI (Gemini or Anthropic) - results cached so repeat views cost nothing
+# AI (Anthropic API, optional) - results cached so repeat views cost nothing
 # ----------------------------------------------------------------------------
 SYSTEM_BASE = (
     "You are Newsie, a friendly, accurate news explainer for readers in India. "
@@ -425,7 +411,7 @@ def ai_enabled():
 
 
 def ai_on():
-    return ai_enabled()
+    return bool(cfg("ANTHROPIC_API_KEY") or cfg("GEMINI_API_KEY"))
 
 
 def _api_error(r):
@@ -437,64 +423,25 @@ def _api_error(r):
     return RuntimeError(f"HTTP {r.status_code}: {str(msg)[:140]}")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def gemini_models():
-    """Ordered list of Gemini models to try. Model names are retired often, so we never rely on one name."""
-    pinned = [m.strip() for m in cfg("GEMINI_MODEL").split(",") if m.strip()]
-    found = []
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def gemini_model():
+    """Pick a working Gemini model automatically (model names change over time)."""
+    if cfg("GEMINI_MODEL"):
+        return cfg("GEMINI_MODEL")
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                         headers={"x-goog-api-key": cfg("GEMINI_API_KEY")}, params={"pageSize": 200}, timeout=8)
+                         headers={"x-goog-api-key": cfg("GEMINI_API_KEY")}, params={"pageSize": 200}, timeout=10)
         r.raise_for_status()
         names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
-        bad = ("tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma",
-               "exp", "thinking", "preview", "vision", "customtools")
-        flash = [n for n in names if "flash" in n and not any(b_ in n for b_ in bad)]
-
-        def ver(n):
-            m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-            return (float(m.group(1)) if m else 0, "lite" not in n)
-        found = sorted(flash, key=ver, reverse=True)
     except Exception:
-        pass
-    out = list(pinned)
-    if "gemini-flash-latest" not in out:
-        out.append("gemini-flash-latest")  # Google's always-current alias
-    out += [n for n in found if n not in out][:4]
-    return out
-
-
-def _gemini_once(model, system, msgs, max_tokens, attempts):
-    """One model, short timeout, automatic retry on timeouts and busy-server errors."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    headers = {"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"}
-    body = {"systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user" if m["role"] == "user" else "model",
-                          "parts": [{"text": m["content"]}]} for m in msgs],
-            "generationConfig": {"maxOutputTokens": max_tokens * 2, "temperature": 0.7,
-                                 "thinkingConfig": {"thinkingBudget": 0}}}
-    last = None
-    for i in range(attempts):
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=(5, 20))
-            if r.status_code == 400 and "thinkingConfig" in body["generationConfig"]:
-                body["generationConfig"].pop("thinkingConfig")  # model may not accept thinkingConfig
-                r = requests.post(url, headers=headers, json=body, timeout=(5, 20))
-            if r.status_code in (429, 500, 502, 503, 504):
-                last = _api_error(r)
-                time.sleep(1.2)
-                continue
-            if not r.ok:
-                raise _api_error(r)
-            cands = r.json().get("candidates", [])
-            text = "".join(p.get("text", "") for p in (cands[0].get("content", {}).get("parts", []) if cands else []))
-            if not text.strip():
-                raise RuntimeError("Empty reply (the answer was blocked or filtered)")
-            return text
-        except (requests.Timeout, requests.ConnectionError) as e:
-            last = e
-    raise last or RuntimeError("AI service did not answer")
+        return "gemini-2.5-flash"
+    bad = ("lite", "tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma", "exp", "thinking")
+    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
+    for p in ("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"):
+        if p in flash:
+            return p
+    return sorted(flash)[-1] if flash else (names[0] if names else "gemini-flash-latest")
 
 
 def _call_llm(system, msgs, max_tokens):
@@ -504,17 +451,38 @@ def _call_llm(system, msgs, max_tokens):
             headers={"x-api-key": cfg("ANTHROPIC_API_KEY"), "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
             json={"model": cfg("ANTHROPIC_MODEL", "claude-haiku-5-5"), "max_tokens": max_tokens,
-                  "system": system, "messages": msgs}, timeout=30)
+                  "system": system, "messages": msgs}, timeout=45)
         if not r.ok:
             raise _api_error(r)
         return "".join(b.get("text", "") for b in r.json().get("content", []))
-    last = None
-    for i, model in enumerate(gemini_models()[:5]):
+    headers = {"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"}
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user" if m["role"] == "user" else "model",
+                          "parts": [{"text": m["content"]}]} for m in msgs],
+            "generationConfig": {"maxOutputTokens": int(max_tokens * 1.5), "temperature": 0.6,
+                                 "thinkingConfig": {"thinkingBudget": 0}}}
+    models = list(dict.fromkeys([gemini_model(), "gemini-2.5-flash"]))
+    if len(models) == 1:
+        models = models * 2  # one retry on the same model
+    last = RuntimeError("AI request failed")
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
-            return _gemini_once(model, system, msgs, max_tokens, 2 if i == 0 else 1)
-        except Exception as e:  # retired model (404), blocked, busy... try the next one
-            last = last or e
-    raise last or RuntimeError("No Gemini model available")
+            r = requests.post(url, headers=headers, json=body, timeout=(8, 28))
+            if r.status_code == 400 and "thinking" in r.text.lower():
+                b2 = json.loads(json.dumps(body))
+                b2["generationConfig"].pop("thinkingConfig")
+                r = requests.post(url, headers=headers, json=b2, timeout=(8, 28))
+            if not r.ok:
+                raise _api_error(r)
+            cands = r.json().get("candidates", [])
+            text = "".join(p.get("text", "") for p in (cands[0].get("content", {}).get("parts", []) if cands else []))
+            if not text.strip():
+                raise RuntimeError("Empty reply (the answer was blocked or filtered)")
+            return text
+        except Exception as e:
+            last = e
+    raise last
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=500)
@@ -561,12 +529,8 @@ def parse_date(s):
         d = parsedate_to_datetime(s)
         return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
     except Exception:
-        pass
-    try:  # ISO dates used by some feeds
-        d = dt.datetime.fromisoformat((s or "").strip().replace("Z", "+00:00"))
-        return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
-    except Exception:
         return None
+
 
 
 B = "https://feeds.bbci.co.uk/news"
@@ -615,6 +579,13 @@ OUTLETS = {
         "Entertainment": f"{HT}/entertainment/rssfeed.xml", "Technology": f"{HT}/technology/rssfeed.xml"}},
 }
 SOURCE_CHOICES = ["All trusted media", "Indian media", "Global media"]
+DOMAINS = {"BBC News": "bbc.com", "The Hindu": "thehindu.com", "Al Jazeera": "aljazeera.com",
+           "The Guardian": "theguardian.com", "NPR": "npr.org", "NDTV": "ndtv.com",
+           "The Indian Express": "indianexpress.com", "Times of India": "timesofindia.indiatimes.com",
+           "Hindustan Times": "hindustantimes.com"}
+FRESH = {"Last 24 hours": 24, "Last 3 days": 72, "Any time": 0}
+EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
 
 
 def clean_author(v):
@@ -650,8 +621,7 @@ def parse_rss(text, provider, outlet=""):
             desc = ""
         img = d.get("img") or d.get("image", "")
         items.append({"title": title, "source": outlet or source or provider.title(), "url": link,
-                      "published": parse_date(d.get("pubdate", "") or d.get("date", "") or d.get("updated", "")),
-                      "text": (desc or title)[:5000],
+                      "published": parse_date(d.get("pubdate", "") or d.get("date", "")), "text": (desc or title)[:5000],
                       "author": clean_author(d.get("creator") or d.get("author", "")),
                       "image": img if img.startswith("https://") else ""})
     return items
@@ -697,7 +667,7 @@ def _rss_bing(query, cat):
 def _rss_google(query, cat):
     base, tail = "https://news.google.com/rss", "hl=en-IN&gl=IN&ceid=IN:en"
     if query:
-        url = f"{base}/search?q={quote_plus(query + ' when:1d')}&{tail}"
+        url = f"{base}/search?q={quote_plus(query)}&{tail}"
     elif CATEGORIES.get(cat):
         url = f"{base}/headlines/section/topic/{CATEGORIES[cat]}?{tail}"
     else:
@@ -708,23 +678,24 @@ def _rss_google(query, cat):
 
 
 def fetch_rss(query, cat):
-    """Ask Bing and Google at the same time; combine what comes back."""
-    out = []
+    """Ask Bing and Google at the same time; use the first that returns stories."""
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = [ex.submit(_rss_bing, query, cat), ex.submit(_rss_google, query, cat)]
         for f in futs:
             try:
-                out += f.result(timeout=9)
+                items = f.result(timeout=9)
+                if items:
+                    return items
             except Exception:
                 continue
-    return out
+    return []
 
 
 def fetch_outlet(name, cat):
     url = OUTLETS[name]["feeds"].get(cat)
     if not url:
         return []
-    r = requests.get(url, headers=BROWSER_UA, timeout=8)
+    r = requests.get(url, headers=UA, timeout=6)
     r.raise_for_status()
     return parse_rss(r.text, "direct", name)
 
@@ -747,9 +718,14 @@ def interleave(lists):
     return out
 
 
-def _gather(names, feed_cat, query):
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_live(query, cat, n, kids, source, fresh):
+    """Newest stories first. Publisher feeds, then site/search top-up. Returns (stories, hours_used)."""
+    want = n * 2 if kids else n
+    names = outlets_for(source)
+    feed_cat = "Top stories" if query else cat
     per = []
-    with ThreadPoolExecutor(max_workers=9) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         futs = [ex.submit(fetch_outlet, nm, feed_cat) for nm in names]
         for f in futs:
             try:
@@ -759,33 +735,33 @@ def _gather(names, feed_cat, query):
     if query:
         words = re.findall(r"\w{3,}", query.lower())
         per = [[a for a in l if any(w in (a["title"] + " " + a["text"]).lower() for w in words)] for l in per]
-    return interleave(per)
-
-
-def _age_h(a):
-    return (now() - a["published"]).total_seconds() / 3600
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _fetch_live(query, cat, n, kids, source):
-    """Publisher feeds first, then other outlets, then search engines. Newest first, last 24 hours preferred.
-    Returns (articles, note). Raises if nothing at all was found."""
-    want = n * 2 if kids else n
-    sq = query or ("Karnataka" if cat == "Karnataka" else "")
-    feed_cat = "Top stories" if query else cat
-    items = _gather(outlets_for(source), feed_cat, query)
-    if len(items) < want and source in OUTLETS:  # chosen outlet had too little: widen to the others
-        items += _gather([k for k in OUTLETS if k != source], feed_cat, query)
+    items = interleave(per)
     if len(items) < want:
         extra = []
-        try:
-            if cfg("NEWSAPI_KEY"):
-                extra = fetch_newsapi(sq, cat, min(want, 100))
-        except Exception:
-            extra = []
+        if source not in OUTLETS:
+            try:
+                if cfg("NEWSAPI_KEY"):
+                    extra = fetch_newsapi(query, cat, min(want, 50))
+            except Exception:
+                extra = []
         if not extra:
-            extra = fetch_rss(sq or None, cat)
+            if source in OUTLETS:
+                qq = " ".join(filter(None, [query, cat if cat != "Top stories" else "", "site:" + DOMAINS[source]]))
+                extra = fetch_rss(qq, None)
+            else:
+                extra = fetch_rss(query, cat)
         items += extra
+
+    def within(a, hrs):
+        return hrs == 0 or a["published"] is None or (now() - a["published"]).total_seconds() <= hrs * 3600
+    first = FRESH.get(fresh, 24)
+    used, cand = first, items
+    for hrs in [first] + ([72, 0] if first == 24 else [0] if first == 72 else []):
+        cand = [a for a in items if within(a, hrs)]
+        used = hrs
+        if len(cand) >= min(want, 6):
+            break
+    items = sorted(cand, key=lambda a: a["published"] or EPOCH, reverse=True)
     if kids:
         items = [a for a in items if not KIDS_BLOCK.search(a["title"] + " " + a["text"])]
     seen, uniq = set(), []
@@ -796,25 +772,27 @@ def _fetch_live(query, cat, n, kids, source):
             uniq.append(a)
     if not uniq:
         raise RuntimeError("no stories")
-    dated = sorted([a for a in uniq if a["published"]], key=lambda a: a["published"], reverse=True)
-    undated = [a for a in uniq if not a["published"]]
-    note = ""
-    pick = [a for a in dated if _age_h(a) <= 24]
-    if len(pick) < min(n, 8):
-        pick = [a for a in dated if _age_h(a) <= 48]
-        note = "Not many stories were published in the last 24 hours, so a few from yesterday are included."
-        if len(pick) < 3:
-            pick = dated + undated
-            note = "Very few fresh stories were found, so some may be older."
-    return pick[:n], note
+    return uniq[:n], used
 
 
-def fetch_news(query, cat, n, kids, source="All trusted media"):
+def fetch_news(query, cat, n, kids, source="All trusted media", fresh="Last 24 hours"):
     """Returns (articles, note). Never raises."""
+    note, res = "", None
     try:
-        return _fetch_live(query, cat, n, kids, source)
+        res = _fetch_live(query, cat, n, kids, source, fresh)
     except Exception:
+        if source != "All trusted media":
+            try:
+                res = _fetch_live(query, cat, n, kids, "All trusted media", fresh)
+                note = f"{source} didn't respond, so we're showing other trusted outlets."
+            except Exception:
+                res = None
+    if res is None:
         return DEMO_ARTICLES[:n], "Live news couldn't be loaded right now, so these are sample stories. Tap Get news to try again."
+    items, used = res
+    if used != FRESH.get(fresh, 24):
+        note = (note + " " if note else "") + f"Not many stories in {fresh.lower()}, so we included older ones."
+    return items, note
 
 
 def public_url(url):
@@ -925,12 +903,12 @@ def credibility(a):
 def time_ago(d):
     if not d:
         return ""
-    s = max(0, int((now() - d).total_seconds()))
+    s = int((now() - d).total_seconds())
     if s < 3600:
         return f"{max(1, s // 60)} min ago"
     if s < 86400:
         return f"{s // 3600} h ago"
-    return d.astimezone(IST).strftime("%d %b %Y")
+    return d.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).strftime("%d %b %Y")
 
 
 def guess_emoji(text, cat="Top stories"):
@@ -942,7 +920,7 @@ def guess_emoji(text, cat="Top stories"):
 
 
 # ----------------------------------------------------------------------------
-# Translation (chunked, retried, parallel, cached)
+# Translation (chunked, retried, parallel, cached) - fixes the old translate errors
 # ----------------------------------------------------------------------------
 def _chunks(text, size=4000):
     parts, cur = [], ""
@@ -954,6 +932,14 @@ def _chunks(text, size=4000):
     if cur:
         parts.append(cur)
     return parts or [text]
+
+
+def _tr_direct(text, code):
+    r = requests.get("https://translate.googleapis.com/translate_a/single",
+                     params={"client": "gtx", "sl": "auto", "tl": code, "dt": "t", "q": text},
+                     headers=UA, timeout=15)
+    r.raise_for_status()
+    return "".join(seg[0] for seg in r.json()[0] if seg and seg[0])
 
 
 def _gtx(text, code):
@@ -1097,11 +1083,6 @@ def dictionary_intent(msg):
 # ----------------------------------------------------------------------------
 # Story Studio content
 # ----------------------------------------------------------------------------
-STRICT = ("Use ONLY facts that appear in the provided text. Never add facts, numbers, names, dates, quotes or "
-          "background that are not in the text. If something is not stated, say 'Not stated in the source'. "
-          "Keep names and numbers exactly as written.")
-
-
 def article_text(a, n=3000):
     return (a.get("full") or a["text"])[:n]
 
@@ -1113,7 +1094,12 @@ def explain_simply(a):
         f"'Why it matters:'. Do not use bullet points. " + STRICT + f"\nTitle: {a['title']}\nText: {article_text(a, 4500)}"}], 450)
     if out:
         return out
-    return short_summary(a, 260) + "\n\n(Tip: the AI helper gives a child-friendly explanation here.)"
+    return short_summary(a, 260) + "\n\n(" + ai_status() + ")"
+
+
+STRICT = ("Use ONLY facts that appear in the provided text. Never add facts, numbers, names, dates, quotes or "
+          "background that are not in the text. If something is not stated, say 'Not stated in the source'. "
+          "Keep names and numbers exactly as written.")
 
 
 def sentences(text, lo=30, hi=420):
@@ -1414,22 +1400,20 @@ def make_quiz(a):
 # ----------------------------------------------------------------------------
 # UI: styling and 3D hero
 # ----------------------------------------------------------------------------
-def inject_css(kids=False):
-    accent = "#FF9F1C" if kids else "#FFC93C"
+def inject_css():
     st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#0F1230;--panel:#1A1E4A;--panel2:#242a63;--sun:__ACCENT__;--coral:#FF6B6B;--mint:#3DDC97;--lilac:#9B8CFF;--txt:#F6F4FF}
+:root{--ink:#0F1230;--panel:#1A1E4A;--panel2:#242a63;--sun:#FFC93C;--coral:#FF6B6B;--mint:#3DDC97;--lilac:#9B8CFF;--txt:#F6F4FF}
 html,body,[class*="css"],.stMarkdown,p,li,label{font-family:'Nunito',system-ui,sans-serif!important}
 h1,h2,h3,h4,.nv-h{font-family:'Baloo 2',system-ui,sans-serif!important;letter-spacing:.2px}
 .block-container{max-width:1100px;padding:1rem 1rem 4rem}
 [data-testid="stHeader"]{background:transparent}
 .stButton>button,.stFormSubmitButton>button,.stDownloadButton>button{border-radius:14px;min-height:44px;font-weight:800;
- border:2px solid rgba(255,255,255,.16);transition:transform .15s ease}
-.stButton>button:hover{transform:translateY(-2px) scale(1.02)}
+ border:2px solid rgba(255,255,255,.16)}
 .stButton>button[kind="primary"],.stFormSubmitButton>button[kind="primary"]{background:var(--sun);color:#1c1650;border-color:var(--sun)}
 .stButton>button:focus-visible{outline:3px solid #fff;outline-offset:2px}
-.nv-card{background:linear-gradient(160deg,var(--panel),#161a40);border:1px solid rgba(255,255,255,.10);border-top:6px solid var(--cc,#FFC93C);border-radius:20px;
+.nv-card{background:linear-gradient(160deg,var(--panel),#161a40);border:1px solid rgba(255,255,255,.10);border-radius:20px;
  padding:16px 18px;margin-bottom:6px;transition:transform .25s ease,box-shadow .25s ease;transform-style:preserve-3d}
 @media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:perspective(900px) rotateX(2deg) translateY(-3px);box-shadow:0 18px 40px rgba(0,0,0,.4)}}
 .nv-card h4{margin:0 0 6px;font-size:1.18rem;line-height:1.3;color:#fff}
@@ -1438,29 +1422,25 @@ h1,h2,h3,h4,.nv-h{font-family:'Baloo 2',system-ui,sans-serif!important;letter-sp
 .chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.78rem;font-weight:800;margin:0 6px 6px 0}
 .chip.pos{background:rgba(61,220,151,.18);color:#3DDC97}.chip.neu{background:rgba(155,140,255,.2);color:#C9C0FF}
 .chip.neg{background:rgba(255,107,107,.2);color:#FF9A9A}.chip.cat{background:rgba(255,201,60,.16);color:#FFC93C}.chip.ok{background:rgba(61,220,151,.14);color:#3DDC97}
-.chip.new{background:#FF6B6B;color:#fff;animation:nvpulse 1.6s ease-in-out infinite}
-@keyframes nvpulse{50%{transform:scale(1.08)}}
 .nv-sum ul{margin:6px 0 0 18px;padding:0}.nv-sum li{margin-bottom:5px}
 .trust{height:7px;border-radius:9px;background:rgba(255,255,255,.1);overflow:hidden;margin:2px 0 4px}
 .trust>i{display:block;height:100%;border-radius:9px}
 .nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:14px;margin-bottom:10px}
-.nv-stat{background:var(--panel);border-radius:18px;padding:14px 16px;border:1px solid rgba(255,255,255,.08);color:#F6F4FF}
+.nv-stat{background:var(--panel);border-radius:18px;padding:14px 16px;border:1px solid rgba(255,255,255,.08)}
 .nv-stat b{font-family:'Baloo 2';font-size:1.8rem;color:var(--sun);display:block;line-height:1.1}
 .nv-note{background:rgba(155,140,255,.12);border-left:4px solid var(--lilac);border-radius:10px;padding:10px 14px;color:#dcd8ff;font-size:.92rem}
-.nv-tick{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#ff5e62,#ff9966);border-radius:14px;padding:7px 10px;margin:2px 0 6px;overflow:hidden}
-.nv-tick b{background:#fff;color:#d62828;padding:2px 10px;border-radius:99px;font-size:.8rem;white-space:nowrap}
-.nv-track{overflow:hidden;flex:1}
-.nv-run{display:inline-block;white-space:nowrap;animation:nvrun 160s linear infinite;color:#fff;font-weight:800}
-.nv-run:hover{animation-play-state:paused}
-.nv-run span{margin-right:56px}
-@keyframes nvrun{to{transform:translateX(-50%)}}
-@media (prefers-reduced-motion:reduce){.nv-run{animation:none}.nv-track{overflow-x:auto}.nv-card:hover{transform:none}}
-.nv-mission{background:linear-gradient(135deg,rgba(255,201,60,.18),rgba(255,107,107,.15));border:2px dashed rgba(255,201,60,.55);
- border-radius:16px;padding:10px 14px;margin:6px 0 4px;font-weight:700}
-.nv-foot{text-align:center;margin-top:34px;padding:18px 10px 6px;border-top:1px solid rgba(128,128,128,.35);font-size:.92rem;line-height:1.7}
-.nv-foot a{font-weight:800;text-decoration:none;margin:0 6px}
+
+.ticker{display:flex;align-items:center;background:var(--panel);border:1px solid rgba(255,255,255,.12);border-radius:14px;overflow:hidden;margin:8px 0 6px}
+.ticker .live{background:#FF4D4D;color:#fff;font-weight:800;padding:10px 14px;white-space:nowrap;animation:blinkdot 1.6s infinite}
+.trk{overflow:hidden;flex:1}.roll{display:inline-block;white-space:nowrap;animation:roll 110s linear infinite;padding:10px 0}
+.ticker:hover .roll{animation-play-state:paused}.tk{margin-right:56px;color:#e9e6ff}.tk b{color:#FFC93C;margin-right:6px}
+@keyframes roll{to{transform:translateX(-50%)}}@keyframes blinkdot{50%{opacity:.75}}
+@media (prefers-reduced-motion:reduce){.roll,.ticker .live{animation:none}.trk{overflow-x:auto}}
+.nv-foot{text-align:center;color:#b9b6e6;font-size:.95rem;padding:22px 0 8px;border-top:1px solid rgba(255,255,255,.12);margin-top:30px;line-height:1.9}
+.nv-foot a{color:#FFC93C;font-weight:800;text-decoration:none;margin:0 10px;white-space:nowrap}.nv-foot .small{font-size:.8rem;opacity:.85}
+.stApp{background:radial-gradient(1100px 520px at 85% -8%,rgba(91,60,255,.22),transparent),radial-gradient(900px 480px at -10% 30%,rgba(255,201,60,.08),transparent),#0F1230}
 @media (max-width:640px){.block-container{padding:.6rem .6rem 4rem}.nv-card h4{font-size:1.05rem}}
-</style>""".replace("__ACCENT__", accent), unsafe_allow_html=True)
+</style>""", unsafe_allow_html=True)
 
 
 HERO_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1469,12 +1449,12 @@ HERO_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="view
 html,body{margin:0;height:100%;background:radial-gradient(120% 120% at 70% 40%,#2a2f7a 0%,#12153e 55%,#0b0d28 100%);overflow:hidden;font-family:Nunito,sans-serif}
 canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:pan-y}
 .t{position:absolute;left:22px;top:18px;right:22px;pointer-events:none;color:#F6F4FF}
-.t h1{font:800 clamp(26px,5.5vw,46px)/1.05 'Baloo 2',sans-serif;margin:0;text-shadow:0 4px 0 #5b3cff}
+.t h1{font:800 clamp(30px,6vw,52px)/1 'Baloo 2',sans-serif;margin:0;text-shadow:0 4px 0 #5b3cff}
 .t p{margin:6px 0 0;font-size:clamp(13px,2.4vw,17px);color:#cfcaff;max-width:30ch}
 .nogl .t{position:static;padding:30px}
 </style></head><body>
 <canvas id="c" aria-hidden="true"></canvas>
-<div class="t"><h1>__APPNAME__ 📰</h1><p>Fresh news, explained for everyone.</p></div>
+<div class="t"><h1>__NAME__ 🦉</h1><p>__TAG__</p></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 (function(){
@@ -1518,103 +1498,14 @@ def hero():
     arts = st.session_state.get("articles") or DEMO_ARTICLES
     heads = [a["title"][:70] for a in arts[:7]]
     payload = json.dumps(heads).replace("</", "<\\/")
-    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__APPNAME__", esc(APP_NAME)), 300)
-
-
-def ticker_html(arts):
-    items = "".join(f"<span>{guess_emoji(a['title'])} {esc(a['title'][:110])}</span>" for a in arts[:20])
-    return f'<div class="nv-tick"><b>🔴 LIVE</b><div class="nv-track"><div class="nv-run">{items}{items}</div></div></div>'
-
-
-def mission_card():
-    """Daily mission: 3 small goals that keep kids (and adults) coming back."""
-    today = now().astimezone(IST).date().isoformat()
-    m = st.session_state.get("mission")
-    if not m or m.get("day") != today:
-        m = st.session_state.mission = {"day": today, "read": set(), "cartoon": False, "quiz": False}
-    parts = [len(m["read"]) >= 3, m["cartoon"], m["quiz"]]
-    n = sum(parts)
-    tick = lambda ok: "✅" if ok else "⬜"
-    st.markdown(f'<div class="nv-mission">🎯 <b>Today\'s mission</b> ({n}/3) &nbsp; '
-                f'{tick(parts[0])} Open 3 stories ({min(3, len(m["read"]))}/3) &nbsp; '
-                f'{tick(parts[1])} Watch a cartoon &nbsp; {tick(parts[2])} Finish a quiz</div>', unsafe_allow_html=True)
-    if n == 3 and not st.session_state.get("mission_done") == today:
-        st.session_state.mission_done = today
-        st.balloons()
-        award(10, "mission_" + today)
-        st.success("🏆 Mission complete! Come back tomorrow to keep your streak.")
-
-
-def contact_email():
-    return cfg("CONTACT_EMAIL", "factdive28@gmail.com")
-
-
-def footer():
-    mail, gh = contact_email(), cfg("GITHUB_URL")
-    links = []
-    if gh.startswith("https://"):
-        links.append(f'<a href="{esc(gh, True)}" target="_blank" rel="noopener noreferrer">💻 GitHub</a>')
-    if mail:
-        links.append(f'<a href="mailto:{esc(mail, True)}">✉️ {esc(mail)}</a>')
-    st.markdown(
-        f'<div class="nv-foot"><b>{esc(APP_NAME)}</b> · Made with ❤️ in India<br>'
-        f'🔒 We never sell your data. Open the <b>Privacy</b> page to see what we keep and why.<br>'
-        f'{" · ".join(links)}<br><small>Summaries link to the original publishers. AI can make mistakes, '
-        f'so always check the source.</small></div>', unsafe_allow_html=True)
-
-
-def privacy_md():
-    mail = contact_email()
-    contact = f"Write to **{mail}**." if mail else "Use the Rate us page to contact the site owner."
-    return f"""
-**Short answer:** we keep as little as possible, we never sell it, and you can delete it yourself any time.
-
-#### What we store
-- Your **nickname, email and age group** (so you can log in and so we know whether Kids Mode is right).
-- Your **password only as a salted hash** (PBKDF2). Nobody, including the owner, can read your real password.
-- Your **XP, streak, saved stories, questions you ask Newsie, and ratings** you send.
-- **Simple usage events** such as "opened a story", with a random visitor ID. We do **not** store your IP address, phone number, address or location.
-
-#### Where it is stored and who can see it
-- In a **PostgreSQL database on Neon**, reached over an encrypted connection. The app itself runs on Streamlit Community Cloud.
-- Only the **site owner** can open the Owner page, which shows nicknames, emails, questions and feedback. This is used to run and improve the app.
-- Publicly, only your **nickname and XP** appear on the leaderboard, and a review appears only if you tick "show publicly".
-- We **do not sell, rent or share** your data and there are **no ads**.
-
-#### Services that receive some text to do their job
-- **Google Gemini** (AI helper): the article text or the question you type to Newsie.
-- **Google Translate and Google text-to-speech**: the text being translated or read aloud.
-- **News publishers** (BBC, The Hindu and others): we only read their public feeds. Nothing about you is sent.
-- **Free dictionary service**: the word you look up.
-
-Please **never type personal details** (full name, school, phone, address) into Ask Newsie.
-
-#### Kids and families
-- Under 18? A parent or guardian must agree when you sign up. Use a nickname, not your full name.
-- Kids Mode hides violent and adult stories and uses simple words. No filter is perfect, so parents should stay nearby.
-
-#### "Keep me logged in"
-- This saves a random token in your browser for 14 days. Only its hash is kept on our side.
-- **Do not share your address bar link after logging in**, because it contains that token. Log out on shared devices.
-
-#### Your control
-- **My Space → Privacy and account deletion** removes your profile, saved stories, chats, ratings and login tokens. Usage events are made anonymous.
-- {contact}
-
-No website can promise perfect security, but we use hashed passwords, parameterised database queries and a locked-down owner page to keep your data safe.
-"""
-
-
-def page_privacy():
-    st.markdown("### 🔒 Privacy and data safety")
-    st.markdown(privacy_md())
+    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__NAME__", esc(APP_NAME)).replace("__TAG__", esc(TAGLINE)), 300)
 
 
 # ----------------------------------------------------------------------------
 # Pages
 # ----------------------------------------------------------------------------
 def auth_screen():
-    st.markdown(f"### Join {esc(APP_NAME)}")
+    st.markdown(f"### Join {APP_NAME}")
     st.caption("Log in to save stories, earn XP and keep your streak. Guests can explore with fewer AI helpers.")
     t1, t2, t3 = st.tabs(["Log in", "Sign up", "Just explore"])
     with t1:
@@ -1639,8 +1530,9 @@ def auth_screen():
             ag = st.selectbox("Age group", ["Under 13", "13 to 17", "18 or older"], index=2)
             c = st.checkbox("A parent or guardian knows about this account and agrees (needed if under 18)")
             keep = st.checkbox("Keep me logged in on this device", value=True, key="su_keep")
-            st.caption("We store your nickname, email, XP and what you save or ask, only to run the app. "
-                       "You can delete everything from My Space at any time. We never sell your data.")
+            st.caption("We keep your nickname, email, XP and what you save or ask, only to run the app. Your password is "
+                       "stored as a one-way hash. See the 🔒 Privacy page (after you log in). You can delete everything "
+                       "from My Space at any time.")
             if st.form_submit_button("Create my account", type="primary", width="stretch"):
                 ok, res = signup(n, e, p, ag, c)
                 if ok:
@@ -1660,14 +1552,12 @@ def auth_screen():
             st.query_params["k"] = "1" if kid else "0"
             log("guest_start")
             st.rerun()
-    with st.expander("🔒 Is my data safe? Where is it stored?"):
-        st.markdown(privacy_md())
 
 
 def sidebar():
     u = st.session_state.get("user")
     with st.sidebar:
-        st.markdown(f"## 📰 {esc(APP_NAME)}")
+        st.markdown(f"## 🦉 {APP_NAME}")
         if u:
             row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))[0]
             (lo, name, icon), nxt = level_of(row["xp"])
@@ -1684,7 +1574,7 @@ def sidebar():
         if u or st.session_state.get("guest"):
             if st.button("Log out" if u else "Leave guest mode", width="stretch"):
                 end_session()
-                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev", "mission"):
+                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev"):
                     st.session_state.pop(k, None)
                 st.rerun()
         with st.expander("🔧 Check connections"):
@@ -1709,20 +1599,14 @@ def card_html(a, summary, cat):
     img = f'<img class="nv-thumb" src="{esc(a["image"], True)}" alt="" loading="lazy">' if a.get("image") else ""
     by = f' · ✍️ {esc(a["author"])}' if a.get("author") else ""
     est = '<span class="chip ok">✅ Established outlet</span>' if a["source"] in OUTLETS or any(t in a["source"].lower() for t in TRUSTED_SOURCES) else ""
-    fresh = '<span class="chip new">🆕 Fresh</span>' if a.get("published") and 0 <= (now() - a["published"]).total_seconds() < 10800 else ""
     lis = "".join(f"<li>{esc(b)}</li>" for b in bullets(summary))
-    return (f'<div class="nv-card" style="--cc:{CAT_COLOR.get(cat, "#FFC93C")}">{img}<h4>{esc(a["title"])}</h4>'
+    return (f'<div class="nv-card">{img}<h4>{esc(a["title"])}</h4>'
             f'<div class="nv-meta">{esc(a["source"])}{by} · {esc(time_ago(a["published"]))}</div>'
-            f'{fresh}<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>{est}'
+            f'<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>{est}'
             f'<div class="nv-sum"><ul>{lis}</ul></div>'
             f'<div class="nv-meta" style="margin-top:10px">Credibility hint: <b style="color:{color}">{label} ({score}/100)</b></div>'
             f'<div class="trust"><i style="width:{score}%;background:{color}"></i></div>'
             f'<div class="nv-meta">{esc("; ".join(why[:2]))}</div></div>')
-
-
-def wa_url(a):
-    text = f"{a['title']}\n{a['url']}\n- via {APP_NAME}" + (f" {cfg('APP_URL')}" if cfg("APP_URL") else "")
-    return "https://wa.me/?text=" + quote_plus(text)
 
 
 @st.dialog("Story Studio", width="large")
@@ -1738,9 +1622,11 @@ def studio(a):
     else:
         st.warning("⚠️ Only the headline and a short snippet were available, so explanations stay brief instead of guessing. "
                    "Open the original for the full story.")
-    log("studio", a["title"][:80])
+    seen = st.session_state.setdefault("studio_seen", set())
+    if a["url"] not in seen:
+        seen.add(a["url"])
+        log("studio", a["title"][:80])
     award(3, "read_" + a["url"])
-    st.session_state.get("mission", {}).get("read", set()).add(a["url"])
     modes = ["📋 2-min briefing", "🎨 Cartoon", "🧒 Explain simply", "🧠 Quiz", "📚 Hard words"]
     mode = st.radio("What would you like?", modes, horizontal=True, key="studio_mode")
     code, voice = LANGS[st.session_state.lang]
@@ -1786,10 +1672,11 @@ def studio(a):
                         p.pop("audio", None)
                     st.caption(f"Clear voice isn't available for this language right now ({type(e).__name__}). "
                                "Using your device's voice instead.")
+        if ("c_" + a["url"]) not in seen:
+            seen.add("c_" + a["url"])
+            log("cartoon", a["title"][:80])
         embed_html(cartoon_html(panels, voice, a["title"]), 640)
         award(10, "cartoon_" + a["url"])
-        if "mission" in st.session_state:
-            st.session_state.mission["cartoon"] = True
         st.caption("The comic only uses facts from the article text." + ("" if ai or ai_on() else " Add GEMINI_API_KEY in Secrets for richer comics."))
     elif mode == modes[2]:
         with st.spinner("Newsie is thinking..."):
@@ -1817,8 +1704,6 @@ def studio(a):
                     else:
                         st.error(f"The answer is: {right}. {z.get('why', '')}")
                 award(5 * score, qk + "_xp")
-                if "mission" in st.session_state:
-                    st.session_state.mission["quiz"] = True
                 log("quiz", f"{score}/{len(quiz)}")
                 st.markdown(f"**You scored {score} out of {len(quiz)}!**")
     else:
@@ -1833,61 +1718,46 @@ def studio(a):
     st.link_button(f"🔗 Read the original at {a['source']}", a["url"], width="stretch")
 
 
-def page_news():
-    kids = st.session_state.kids
-    cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
-    tick_ph = st.container()
-    mission_card()
-    topic = st.pills("⚡ Quick topics", list(TOPICS), key="topic_pill", label_visibility="collapsed")
-    with st.form("news_form"):
-        query = st.text_input("Search a topic", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
-        c2, c3, c4 = st.columns(3)
-        cat = c2.selectbox("Category", cats)
-        source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
-        n = c4.slider("Stories", 10, MAX_STORIES, 30)
-        go = st.form_submit_button("🔎 Get fresh news", type="primary", width="stretch")
-    topic_changed = topic != st.session_state.get("last_topic")
-    st.session_state.last_topic = topic
-    first = "articles" not in st.session_state
-    if go or first or topic_changed or st.session_state.get("kids_prev") != kids:
-        eff = query.strip() if go else (TOPICS.get(topic, "") if topic else query.strip())
-        with st.spinner("Fetching fresh stories..."):
-            arts, note = fetch_news(eff, cat, n, kids, source)
-        st.session_state.articles, st.session_state.note = arts, note
-        st.session_state.cat = cat
-        st.session_state.kids_prev = kids
-        st.session_state.shown = 12
-        st.session_state.fetched_at = now()
-        if go or topic_changed:
-            log("search", f"{cat}|{eff}"[:100])
-    arts = st.session_state.get("articles", [])
-    live = bool(arts) and arts[0]["source"] != "Sample story"
-    if live:
-        with tick_ph:
-            st.markdown(ticker_html(arts), unsafe_allow_html=True)
-            fa = st.session_state.get("fetched_at")
-            st.caption(f"🕒 Updated {fa.astimezone(IST).strftime('%I:%M %p')} IST · {len(arts)} stories, newest first" if fa else "")
-    if st.session_state.get("note"):
-        (st.info if live else st.warning)(st.session_state.note)
-    if kids:
-        st.markdown('<div class="nv-note">🧸 Kids Mode is on: gentle stories only, simple explanations and comics.</div>',
-                    unsafe_allow_html=True)
-    code = LANGS[st.session_state.lang][0]
-    shown = st.session_state.setdefault("shown", 12)
-    view = arts[:shown]
-    summaries = [short_summary(a) for a in view]
-    if code != "en":
-        with st.spinner("Translating..."):
-            try:
-                summaries = translate_many(tuple(summaries), code)
-            except Exception as e:
-                st.warning("Translation is busy right now, so summaries are in English. Please try again shortly.")
-                st.caption(f"Technical detail: {str(e)[:160]}")
-    cols = st.columns(2) if len(view) > 1 else [st.container()]
-    for i, (a, s) in enumerate(zip(view, summaries)):
+def greeting():
+    h = (now() + dt.timedelta(hours=5, minutes=30)).hour
+    return "Good morning" if h < 12 else "Good afternoon" if h < 17 else "Good evening"
+
+
+def ticker_html(arts):
+    rows = "".join(f'<span class="tk"><b>{esc(a["source"])}</b> {esc(a["title"])}</span>' for a in arts[:12])
+    return f'<div class="ticker"><span class="live">🔴 LIVE</span><div class="trk"><div class="roll">{rows}{rows}</div></div></div>'
+
+
+def mission_card():
+    """Daily checklist: open 3 stories, watch a cartoon, finish a quiz (+20 XP when all are done)."""
+    today = now().date().isoformat()
+    who, val = ("user_id", uid()) if uid() else ("sid", st.session_state.sid)
+
+    def count(kind):
+        return q(f"SELECT COUNT(*) c FROM events WHERE kind=? AND {who}=? AND substr(ts,1,10)=?", (kind, val, today))[0]["c"]
+    n_story, n_cartoon, n_quiz = count("studio"), count("cartoon"), count("quiz")
+    tasks = [(n_story >= 3, f"Open 3 stories ({min(n_story, 3)}/3)"), (n_cartoon >= 1, "Watch a cartoon"),
+             (n_quiz >= 1, "Finish a quiz")]
+    done = sum(1 for ok, _ in tasks if ok)
+    if uid() and done == 3 and not q("SELECT 1 FROM events WHERE kind='mission' AND user_id=? AND substr(ts,1,10)=?", (uid(), today)):
+        log("mission")
+        award(20, "mission_" + today)
+        st.balloons()
+    u = st.session_state.get("user")
+    name = esc(u["name"]) if u else "friend"
+    c1, c2 = st.columns([3, 2])
+    c1.markdown(f"#### 👋 {greeting()}, {name}!")
+    c2.markdown(f"**🎯 Today's mission ({done}/3)**  \n" + "  \n".join(("✅ " if ok else "⬜ ") + t for ok, t in tasks))
+    c2.progress(done / 3, text="Complete all 3 for +20 XP" if done < 3 else "Mission complete! +20 XP 🎉")
+
+
+@st.fragment
+def story_cards(arts, summaries, cat):
+    cols = st.columns(2) if len(arts) > 1 else [st.container()]
+    for i, (a, s_) in enumerate(zip(arts, summaries)):
         aid = hashlib.sha1((a["url"] + a["title"]).encode()).hexdigest()[:8]
         with cols[i % len(cols)]:
-            st.markdown(card_html(a, s, st.session_state.get("cat", "Top stories")), unsafe_allow_html=True)
+            st.markdown(card_html(a, s_, cat), unsafe_allow_html=True)
             b1, b2, b3 = st.columns(3)
             if b1.button("✨ Studio", key=f"st_{aid}", width="stretch", type="primary"):
                 studio(a)
@@ -1902,12 +1772,64 @@ def page_news():
                 else:
                     st.toast("Log in to save stories", icon="🔒")
             b3.link_button("🔗 Source", a["url"], width="stretch")
-            d1, d2 = st.columns(2)
-            d1.link_button("🔍 Cross-check", f"https://www.google.com/search?q={quote_plus(a['title'])}&tbm=nws", width="stretch")
-            d2.link_button("📲 Share", wa_url(a), width="stretch")
-    if shown < len(arts):
-        if st.button(f"⬇️ Show more stories ({len(arts) - shown} more)", key="more_btn", width="stretch"):
-            st.session_state.shown = shown + 12
+            c1, c2 = st.columns(2)
+            c1.link_button("🔍 Cross-check", f"https://www.google.com/search?q={quote_plus(a['title'])}&tbm=nws", width="stretch")
+            c2.link_button("📤 Share", f"https://wa.me/?text={quote_plus(a['title'] + ' ' + a['url'])}", width="stretch")
+
+
+def page_news():
+    kids = st.session_state.kids
+    cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
+    mission_card()
+    opts = [f"{CAT_EMOJI.get(c, '📰')} {c}" for c in cats]
+    with st.form("news_form"):
+        pick = st.pills("Pick a topic", opts, selection_mode="single", default=opts[0], key="cat_pill")
+        query = st.text_input("Or search anything", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
+        c3, c4, c5 = st.columns(3)
+        source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
+        fresh = c4.selectbox("How fresh?", list(FRESH))
+        n = c5.slider("Stories", 5, 50, 20)
+        go = st.form_submit_button("🔎 Get latest news", type="primary", width="stretch")
+    cat = (pick or opts[0]).split(" ", 1)[1]
+    first = "articles" not in st.session_state
+    if go or first or st.session_state.get("kids_prev") != kids:
+        with st.spinner("Fetching the latest stories..."):
+            arts, note = fetch_news(query.strip(), cat, n, kids, source, fresh)
+        st.session_state.update(articles=arts, note=note, cat=cat, kids_prev=kids, updated=now(), show_n=12)
+        if go:
+            log("search", f"{cat}|{query}"[:100])
+    arts = st.session_state.get("articles", [])
+    note = st.session_state.get("note", "")
+    if note:
+        (st.warning if note.startswith("Live news") else st.info)(note)
+    live = [a for a in arts if a["source"] != "Sample story"]
+    if live:
+        st.markdown(ticker_html(live), unsafe_allow_html=True)
+        upd = st.session_state.get("updated")
+        when = (upd + dt.timedelta(hours=5, minutes=30)).strftime("%I:%M %p") if upd else ""
+        st.caption(f"🕒 Updated {when} IST · {len(arts)} stories from {len({a['source'] for a in arts})} sources · newest first")
+    if kids:
+        st.markdown('<div class="nv-note">🧸 Kids Mode is on: gentle stories only, simple explanations and comics.</div>',
+                    unsafe_allow_html=True)
+    show_n = st.session_state.get("show_n", 12)
+    visible = arts[:show_n]
+    code = LANGS[st.session_state.lang][0]
+    summaries = [short_summary(a) for a in visible]
+    if code != "en":
+        with st.spinner("Translating..."):
+            try:
+                summaries = translate_many(tuple(summaries), code)
+            except Exception as e:
+                alt = llm_translate(summaries, code)
+                if alt:
+                    summaries = alt
+                else:
+                    st.warning("Translation is not working right now, so summaries are in English.")
+                    st.caption(f"Details: {str(e)[:220]}")
+    story_cards(visible, summaries, st.session_state.get("cat", "Top stories"))
+    if len(arts) > show_n:
+        if st.button(f"⬇️ Load more stories ({len(arts) - show_n} left)", width="stretch", key="more_btn"):
+            st.session_state.show_n = show_n + 12
             st.rerun()
 
 
@@ -1972,8 +1894,7 @@ def page_ask():
         x("INSERT INTO chats(user_id,ts,question,answer) VALUES(?,?,?,?)", (uid(), iso(), msg[:400], ans[:1500]))
         log("chat")
         award(1, "chat_" + str(len(st.session_state.chat)))
-    st.caption(f"Questions you ask are saved to help improve {APP_NAME} and are sent to Google's AI to get an answer. "
-               "Please don't share personal details.")
+    st.caption("Questions you ask are saved to help improve the app. Please don't share personal details.")
 
 
 def page_space():
@@ -2007,7 +1928,7 @@ def page_space():
                  hide_index=True, width="stretch")
     with st.expander("Privacy and account deletion"):
         st.write("Your password is stored only as a salted hash. We never sell your data. "
-                 "Deleting your account removes your profile, saved stories, chats, feedback and login tokens.")
+                 "Deleting your account removes your profile, saved stories, chats and feedback.")
         ok = st.checkbox("I understand this cannot be undone", key="del_ok")
         if st.button("Delete my account and data", disabled=not ok):
             delete_user_data(u["id"])
@@ -2018,7 +1939,7 @@ def page_space():
 
 
 def page_feedback():
-    st.markdown(f"### ⭐ Rate {esc(APP_NAME)}")
+    st.markdown(f"### ⭐ Rate {APP_NAME}")
     u = st.session_state.get("user")
     with st.form("fb_form", clear_on_submit=True):
         stars = st.feedback("stars")
@@ -2087,12 +2008,10 @@ def page_admin():
             st.success("✅ Your data is stored in a permanent PostgreSQL database. It survives restarts and redeploys.")
         else:
             st.warning("⚠️ Temporary database: Streamlit Cloud erases it on restart. Add DATABASE_URL in Secrets "
-                       "(free Neon database) and download a backup below until then.")
+                       "(free Neon database, see instructions) and download a backup below until then.")
             if os.path.exists(DB_PATH):
                 with open(DB_PATH, "rb") as fh:
-                    st.download_button("Download full database backup", fh.read(), "app_backup.db")
-        if not cfg("GITHUB_URL"):
-            st.info("Footer tip: add GITHUB_URL = \"https://github.com/yourname/yourrepo\" in Secrets to show your GitHub link.")
+                    st.download_button("Download full database backup", fh.read(), "newsverse_backup.db")
         em = st.text_input("Delete a user's data by email (for privacy requests)")
         if em and st.button("Delete this user's data"):
             r = q("SELECT id FROM users WHERE email=?", (em.strip().lower(),))
@@ -2106,6 +2025,83 @@ def page_admin():
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+def health_check():
+    rows = []
+
+    def t(name, fn):
+        try:
+            rows.append((name, "✅", str(fn())[:90]))
+        except Exception as e:
+            rows.append((name, "❌", f"{type(e).__name__}: {str(e)[:140]}"))
+
+    def ai_test():
+        if not ai_on():
+            raise RuntimeError("No GEMINI_API_KEY / ANTHROPIC_API_KEY found in Secrets")
+        return "replied: " + _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
+
+    def voice_test():
+        from gtts import gTTS
+        gTTS(text="hello", lang="en").write_to_fp(io.BytesIO())
+        return "server voice works"
+
+    t("News feeds", lambda: f"{len(fetch_rss(None, 'Top stories'))} stories from Bing/Google")
+    t("Translation (Hindi)", lambda: _tr("Good morning friends", "hi"))
+    t("Dictionary", lambda: (define("economy") or "no result").split("\n")[0])
+    t("AI helper", ai_test)
+    t("Clear voice (gTTS)", voice_test)
+    return rows
+
+
+def footer():
+    gh = cfg("GITHUB_URL", "https://github.com/keerthanam01-nov")
+    mail = cfg("CONTACT_EMAIL", "keerthanam8073@gmail.com")
+    app = cfg("APP_URL", "https://ainewsdaily.streamlit.app")
+    share = f"https://wa.me/?text={quote_plus(APP_NAME + ' - ' + TAGLINE + ': ' + app)}"
+    st.markdown(
+        f'<div class="nv-foot"><div>🦉 <b>{esc(APP_NAME)}</b> · {esc(TAGLINE)} · Made in India 🇮🇳</div>'
+        f'<div><a href="{esc(gh, True)}" target="_blank" rel="noopener noreferrer">💻 GitHub</a>'
+        f'<a href="mailto:{esc(mail, True)}">✉️ Email us</a>'
+        f'<a href="{esc(share, True)}" target="_blank" rel="noopener noreferrer">📤 Share on WhatsApp</a></div>'
+        f'<div class="small">Your data is private: see the 🔒 Privacy page. AI summaries can make mistakes, so always check the source.</div></div>',
+        unsafe_allow_html=True)
+
+
+def page_privacy():
+    mail = cfg("CONTACT_EMAIL", "keerthanam8073@gmail.com")
+    store = ("a **PostgreSQL cloud database (Neon)**, reached over an encrypted connection (TLS)" if using_pg()
+             else "**temporary storage on the app server** (the owner is moving this to a permanent secure database)")
+    st.markdown("### 🔒 Your data and privacy")
+    st.markdown(f"""
+**Where is my data kept?** In {store}. The app itself runs on Streamlit Community Cloud.
+
+**Who can see it?** Only the site owner, through a private Owner page that needs the owner's login. Other users never see your email.
+The leaderboard shows nicknames only. Your review is public only if you tick "show my review publicly".
+
+| What we keep | Why |
+|---|---|
+| Nickname, email, age group | Your account and Kids Mode |
+| Password | Stored only as a salted one-way hash. Nobody, including the owner, can read it. |
+| XP, streak, saved stories | Your progress and My Space |
+| Questions asked to Newsie, ratings, feedback | To answer you and improve the app |
+| Which feature was used and when (no location, no phone number) | To count how many people use the site |
+
+**We never** sell your data, show ads, or ask for your phone number, address or location.
+
+**Other services that see text:** the story text or question you send is processed by Google (Gemini AI, Translate and
+text-to-speech) and MyMemory (translation backup). News is fetched from the publishers' own websites.
+Please don't type personal details into the chat.
+
+**Children:** Kids Mode hides violent stories. Accounts for people under 18 need a parent or guardian's OK. A parent can
+ask us to delete a child's data at any time.
+
+**Your control:** delete your account and all your data yourself in **🧭 My Space → Privacy and account deletion**, or email
+[{mail}](mailto:{mail}).
+
+**Honest note:** no website can promise to be 100% safe. We use hashed passwords, login lock after wrong tries, protected database
+queries and encrypted connections to keep your data as safe as we can.
+""")
+
+
 def ls_helper(action, token=""):
     """Best effort: remember the login token in this browser so the person stays logged in next visit."""
     js = {"save": f"P.localStorage.setItem('nv_s',{json.dumps(token)});",
@@ -2141,7 +2137,7 @@ def health_check():
 
     def outlets_test():
         ok, bad = [], []
-        with ThreadPoolExecutor(max_workers=9) as ex:
+        with ThreadPoolExecutor(max_workers=8) as ex:
             futs = {nm: ex.submit(fetch_outlet, nm, "Top stories") for nm in OUTLETS}
             for nm, f in futs.items():
                 try:
@@ -2176,7 +2172,7 @@ def main():
     restore_session()
     if "kids_set" in st.session_state:
         st.session_state.kids = st.session_state.pop("kids_set")
-    inject_css(st.session_state.kids)
+    inject_css()
     if "visit_logged" not in st.session_state:
         st.session_state.visit_logged = True
         log("visit")
