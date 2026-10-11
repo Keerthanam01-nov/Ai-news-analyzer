@@ -68,6 +68,36 @@ CATEGORIES = {
     "Sports": "SPORTS", "Entertainment": "ENTERTAINMENT",
 }
 KIDS_CATEGORIES = ["Top stories", "Science", "Technology", "Sports", "Entertainment", "World", "Health"]
+STREAK_BADGES = [(3, "🥉", "3-day streak"), (7, "🥇", "Week Warrior"), (14, "💎", "Fortnight Hero"), (30, "👑", "Monthly Legend")]
+CAT_COLOR = {"Top stories": "#5B3CFF", "India": "#FF9933", "Karnataka": "#E4572E", "World": "#3BB9FF", "Business": "#1FBF8A",
+             "Technology": "#00B8D9", "Science": "#7C4DFF", "Health": "#FF5C8A", "Sports": "#FF6B6B", "Entertainment": "#C13BFF"}
+FACTS = ["Octopuses have three hearts.", "A day on Venus is longer than a year on Venus.",
+         "Bananas are berries, but strawberries are not.", "The Moon moves about 3.8 cm farther from Earth every year.",
+         "Lightning can be hotter than the surface of the Sun.", "Sharks are older than trees.",
+         "Honey can last for thousands of years if it is kept sealed.", "Your heart beats about 100,000 times every day.",
+         "India's national animal is the tiger and its national bird is the peacock.",
+         "In August 2023 India's Chandrayaan-3 landed near the Moon's south pole region."]
+WORDS = [("Inflation", "When prices of things keep rising, so the same money buys less."),
+         ("Budget", "A plan for how much money will come in and how it will be spent."),
+         ("Democracy", "A way of running a country where people choose their leaders by voting."),
+         ("Monsoon", "The season of heavy rain that gives water to farms across India."),
+         ("Export", "Selling goods from your country to another country."),
+         ("Import", "Buying goods from another country."),
+         ("Satellite", "An object that travels around Earth or another planet, like the Moon does."),
+         ("Climate", "The usual weather of a place over many years."),
+         ("Constitution", "The book of main rules and rights of a country."),
+         ("Election", "When people vote to choose a leader or a government."),
+         ("Vaccine", "A medicine that helps your body fight a particular disease."),
+         ("Renewable energy", "Power from sources that do not run out, like sun, wind and water."),
+         ("Biodiversity", "The variety of all living things in a place."),
+         ("Treaty", "A written agreement between countries."),
+         ("Economy", "How money, jobs, goods and services are made and shared in a country."),
+         ("Parliament", "The group of elected people who make the laws of a country."),
+         ("Refugee", "A person who has to leave their country to stay safe."),
+         ("Ecosystem", "Living things and their surroundings, working together."),
+         ("GDP", "The total value of everything a country makes in a year."),
+         ("Tariff", "A tax on goods that come in from another country."),
+         ("Sanction", "A punishment, often a limit on trade, that countries use to pressure another country.")]
 LEVELS = [(0, "Cub Reporter", "🐣"), (50, "News Explorer", "🧭"), (150, "Story Detective", "🕵️"),
           (400, "Chief Editor", "👑"), (900, "News Legend", "🌟")]
 
@@ -297,11 +327,11 @@ def _th(tok):
 
 
 def create_session(user_id):
-    """Remember-me token (14 days). Only its hash is stored in the database."""
+    """Remember-me token (30 days). Only its hash is stored in the database."""
     tok = secrets.token_urlsafe(32)
     x("DELETE FROM sessions WHERE expires<?", (iso(),))
     x("INSERT INTO sessions(token_hash,user_id,expires) VALUES(?,?,?)",
-      (_th(tok), user_id, (now() + dt.timedelta(days=14)).isoformat(timespec="seconds")))
+      (_th(tok), user_id, (now() + dt.timedelta(days=30)).isoformat(timespec="seconds")))
     return tok
 
 
@@ -379,7 +409,12 @@ def award(points, key):
     if row[0]["last_active"] != today:
         yday = (now().date() - dt.timedelta(days=1)).isoformat()
         streak = streak + 1 if row[0]["last_active"] == yday else 1
+    prev = row[0]["streak"] or 0
     x("UPDATE users SET xp=xp+?, streak=?, last_active=? WHERE id=?", (points, streak, today, u["id"]))
+    for d_, ic, nm in STREAK_BADGES:
+        if prev < d_ <= streak:
+            st.toast(f"New badge: {ic} {nm}!", icon="🎖️")
+            st.balloons()
     if points > 1:
         st.toast(f"+{points} XP", icon="🌟")
 
@@ -420,14 +455,20 @@ def _api_error(r):
         msg = e.get("message") if isinstance(e, dict) else str(e)
     except Exception:
         msg = r.text[:120]
-    return RuntimeError(f"HTTP {r.status_code}: {str(msg)[:140]}")
+    return RuntimeError(f"HTTP {r.status_code}: {str(msg)[:300]}")
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def gemini_model():
-    """Pick a working Gemini model automatically (model names change over time)."""
+def _ver(name):
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    return float(m.group(1)) if m else 0.0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def gemini_candidates():
+    """Flash models this key can use, newest first (Google retires models often, so never hard-code)."""
     if cfg("GEMINI_MODEL"):
-        return cfg("GEMINI_MODEL")
+        return [cfg("GEMINI_MODEL"), "gemini-flash-latest"]
+    names = []
     try:
         r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
                          headers={"x-goog-api-key": cfg("GEMINI_API_KEY")}, params={"pageSize": 200}, timeout=10)
@@ -435,13 +476,45 @@ def gemini_model():
         names = [m["name"].split("/")[-1] for m in r.json().get("models", [])
                  if "generateContent" in m.get("supportedGenerationMethods", [])]
     except Exception:
-        return "gemini-2.5-flash"
+        pass
     bad = ("lite", "tts", "image", "live", "audio", "embedding", "robotics", "computer", "learnlm", "gemma", "exp", "thinking")
-    flash = [n for n in names if "flash" in n and not any(b in n for b in bad)]
-    for p in ("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"):
-        if p in flash:
-            return p
-    return sorted(flash)[-1] if flash else (names[0] if names else "gemini-flash-latest")
+    flash = {n for n in names if "flash" in n and not any(b_ in n for b_ in bad) and not n.endswith("latest")}
+    ranked = sorted(flash, key=lambda n: ("preview" in n, -_ver(n), n))
+    return ranked[:3] + ["gemini-flash-latest"]
+
+
+@st.cache_resource
+def _model_state():
+    return {"ok": None, "tc": {}}
+
+
+TC_VARIANTS = [{"thinkingBudget": 0}, {"thinkingLevel": "minimal"}, {"thinkingLevel": "low"}, None]
+
+
+def _gemini_once(model, system, msgs, max_tokens, state):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"}
+    base = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user" if m["role"] == "user" else "model",
+                          "parts": [{"text": m["content"]}]} for m in msgs],
+            "generationConfig": {"maxOutputTokens": int(max_tokens * 2), "temperature": 0.6}}
+    r = None
+    for i in range(state["tc"].get(model, 0), len(TC_VARIANTS)):
+        body = json.loads(json.dumps(base))
+        if TC_VARIANTS[i]:
+            body["generationConfig"]["thinkingConfig"] = TC_VARIANTS[i]
+        r = requests.post(url, headers=headers, json=body, timeout=(8, 28))
+        if r.status_code == 400 and TC_VARIANTS[i] is not None and "think" in r.text.lower():
+            continue  # this model wants a different thinking setting
+        state["tc"][model] = i
+        break
+    if not r.ok:
+        raise _api_error(r)
+    cands = r.json().get("candidates", [])
+    text = "".join(p.get("text", "") for p in (cands[0].get("content", {}).get("parts", []) if cands else []))
+    if not text.strip():
+        raise RuntimeError("Empty reply (the answer was blocked or filtered)")
+    return text
 
 
 def _call_llm(system, msgs, max_tokens):
@@ -454,34 +527,26 @@ def _call_llm(system, msgs, max_tokens):
                   "system": system, "messages": msgs}, timeout=45)
         if not r.ok:
             raise _api_error(r)
-        return "".join(b.get("text", "") for b in r.json().get("content", []))
-    headers = {"x-goog-api-key": cfg("GEMINI_API_KEY"), "content-type": "application/json"}
-    body = {"systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user" if m["role"] == "user" else "model",
-                          "parts": [{"text": m["content"]}]} for m in msgs],
-            "generationConfig": {"maxOutputTokens": int(max_tokens * 1.5), "temperature": 0.6,
-                                 "thinkingConfig": {"thinkingBudget": 0}}}
-    models = list(dict.fromkeys([gemini_model(), "gemini-2.5-flash"]))
-    if len(models) == 1:
-        models = models * 2  # one retry on the same model
-    last = RuntimeError("AI request failed")
-    for model in models:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        return "".join(b_.get("text", "") for b_ in r.json().get("content", []))
+    state = _model_state()
+    queue = list(dict.fromkeys(([state["ok"]] if state["ok"] else []) + gemini_candidates()))
+    tried, last, t0 = [], RuntimeError("AI request failed"), time.time()
+    while queue and len(tried) < 4 and time.time() - t0 < 75:
+        model = queue.pop(0)
+        if model in tried:
+            continue
+        tried.append(model)
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=(8, 28))
-            if r.status_code == 400 and "thinking" in r.text.lower():
-                b2 = json.loads(json.dumps(body))
-                b2["generationConfig"].pop("thinkingConfig")
-                r = requests.post(url, headers=headers, json=b2, timeout=(8, 28))
-            if not r.ok:
-                raise _api_error(r)
-            cands = r.json().get("candidates", [])
-            text = "".join(p.get("text", "") for p in (cands[0].get("content", {}).get("parts", []) if cands else []))
-            if not text.strip():
-                raise RuntimeError("Empty reply (the answer was blocked or filtered)")
+            text = _gemini_once(model, system, msgs, max_tokens, state)
+            state["ok"] = model
             return text
         except Exception as e:
             last = e
+            if state["ok"] == model:
+                state["ok"] = None
+            for sug in re.findall(r"models/([\w.\-]+)", str(e)):  # Google names a replacement model in its 404
+                if "flash" in sug and sug not in tried and sug not in queue:
+                    queue.insert(0, sug)
     raise last
 
 
@@ -695,7 +760,7 @@ def fetch_outlet(name, cat):
     url = OUTLETS[name]["feeds"].get(cat)
     if not url:
         return []
-    r = requests.get(url, headers=UA, timeout=6)
+    r = requests.get(url, headers={**UA, "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"}, timeout=7)
     r.raise_for_status()
     return parse_rss(r.text, "direct", name)
 
@@ -1040,22 +1105,72 @@ def tr_safe(text):
 # ----------------------------------------------------------------------------
 # Dictionary
 # ----------------------------------------------------------------------------
+def _dict_api(word):
+    r = requests.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote_plus(word.lower())}", timeout=8)
+    if r.status_code != 200:
+        return None
+    e = r.json()[0]
+    lines = [f"**{e.get('word', word)}**" + (f"  ·  _{e['phonetic']}_" if e.get("phonetic") else "")]
+    for m in e.get("meanings", [])[:2]:
+        d = m["definitions"][0]
+        lines.append(f"- *{m.get('partOfSpeech', '')}*: {d['definition']}")
+        if d.get("example"):
+            lines.append(f"  - Example: “{d['example']}”")
+    return "\n".join(lines)
+
+
+def _wiktionary(word):
+    r = requests.get(f"https://en.wiktionary.org/api/rest_v1/page/definition/{quote_plus(word.lower())}", headers=UA, timeout=8)
+    if r.status_code != 200:
+        return None
+    rows = r.json().get("en") or []
+    if not rows:
+        return None
+    lines = [f"**{word}**"]
+    for m in rows[:2]:
+        lines.append(f"- *{m.get('partOfSpeech', '').lower()}*: {strip_tags(m['definitions'][0]['definition'])}")
+    return "\n".join(lines)
+
+
 @st.cache_data(ttl=7 * 86400, show_spinner=False)
 def define(word):
+    for fn in (_dict_api, _wiktionary):
+        try:
+            out = fn(word)
+        except Exception:
+            out = None
+        if out:
+            return out
+    return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def wiki_summary(term):
+    """Short factual intro from Wikipedia for names, places, things (works without the AI helper)."""
     try:
-        r = requests.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{quote_plus(word.lower())}", timeout=8)
-        if r.status_code != 200:
+        r = requests.get("https://en.wikipedia.org/w/api.php", headers=UA, timeout=8,
+                         params={"action": "query", "list": "search", "srsearch": term, "srlimit": 1, "format": "json"})
+        hits = r.json().get("query", {}).get("search", [])
+        if not hits:
             return None
-        e = r.json()[0]
-        lines = [f"**{e.get('word', word)}**" + (f"  ·  _{e['phonetic']}_" if e.get("phonetic") else "")]
-        for m in e.get("meanings", [])[:2]:
-            d = m["definitions"][0]
-            lines.append(f"- *{m.get('partOfSpeech', '')}*: {d['definition']}")
-            if d.get("example"):
-                lines.append(f"  - Example: “{d['example']}”")
-        return "\n".join(lines)
+        title = hits[0]["title"]
+        r = requests.get("https://en.wikipedia.org/api/rest_v1/page/summary/" + quote_plus(title.replace(" ", "_")),
+                         headers=UA, timeout=8)
+        j = r.json()
+        if r.status_code != 200 or j.get("type") == "disambiguation" or not j.get("extract"):
+            return None
+        ex = " ".join(re.split(r"(?<=[.!?])\s+", j["extract"])[:3])
+        link = j.get("content_urls", {}).get("desktop", {}).get("page", "https://en.wikipedia.org")
+        return f"**{j.get('title', title)}**\n\n{ex}\n\n[Read more on Wikipedia]({link})"
     except Exception:
         return None
+
+
+def lookup(term):
+    return define(term) or wiki_summary(term)
+
+
+KIDS_TOPIC_BLOCK = re.compile(r"\b(ak-?47|guns?|rifles?|pistols?|weapons?|bombs?|porn\w*|sex\w*|drugs?|suicide|murder|rape)\b", re.I)
 
 
 def hard_words(text, k=4):
@@ -1070,14 +1185,20 @@ def hard_words(text, k=4):
 
 def dictionary_intent(msg):
     m = msg.strip().lower().rstrip("?.! ")
-    pats = [r"^(?:define|meaning of|dictionary|word)\s*:?\s+([a-z][a-z\- ]{1,30})$",
-            r"^what(?:'s| is)? the meaning of\s+([a-z][a-z\- ]{1,30})$",
-            r"^what does\s+([a-z][a-z\- ]{1,30})\s+mean$", r"^([a-z][a-z\-]{2,24})$"]
+    pats = [r"^(?:define|meaning of|dictionary|word)\s*:?\s+([a-z0-9][a-z0-9\- ]{1,40})$",
+            r"^what(?:'s| is)? the meaning of\s+([a-z0-9][a-z0-9\- ]{1,40})$",
+            r"^what does\s+([a-z0-9][a-z0-9\- ]{1,40})\s+mean$", r"^([a-z0-9][a-z0-9\-]{2,24})$"]
     for p in pats:
         mt = re.match(p, m)
         if mt:
             return mt.group(1).strip()
     return None
+
+
+def whatis_intent(msg):
+    m = msg.strip().lower().rstrip("?.! ")
+    mt = re.match(r"^(?:what|who)(?:'s| is| are| was| were)\s+(?:an?\s+|the\s+)?([a-z0-9][a-z0-9\- ]{1,40})$", m)
+    return mt.group(1).strip() if mt else None
 
 
 # ----------------------------------------------------------------------------
@@ -1400,47 +1521,81 @@ def make_quiz(a):
 # ----------------------------------------------------------------------------
 # UI: styling and 3D hero
 # ----------------------------------------------------------------------------
-def inject_css():
-    st.markdown("""
+BASE_CSS = r"""
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#0F1230;--panel:#1A1E4A;--panel2:#242a63;--sun:#FFC93C;--coral:#FF6B6B;--mint:#3DDC97;--lilac:#9B8CFF;--txt:#F6F4FF}
+:root{--bg:#FFF9F0;--card:#FFFFFF;--ink:#1F1B4D;--muted:#6B6890;--violet:#5B3CFF;--violet2:#8B5CF6;--sun:#FFC93C;--coral:#FF6B6B;
+--mint:#1FBF8A;--sky:#3BB9FF;--line:rgba(31,27,77,.10);--shadow:0 8px 28px rgba(91,60,255,.10)}
+html{font-size:__SIZE__%}
 html,body,[class*="css"],.stMarkdown,p,li,label{font-family:'Nunito',system-ui,sans-serif!important}
 h1,h2,h3,h4,.nv-h{font-family:'Baloo 2',system-ui,sans-serif!important;letter-spacing:.2px}
-.block-container{max-width:1100px;padding:1rem 1rem 4rem}
+.stApp{background:radial-gradient(900px 420px at 92% -8%,rgba(91,60,255,.10),transparent),radial-gradient(800px 420px at -8% 18%,rgba(255,201,60,.20),transparent),var(--bg)}
+.block-container{max-width:1120px;padding:1rem 1rem 4rem}
 [data-testid="stHeader"]{background:transparent}
-.stButton>button,.stFormSubmitButton>button,.stDownloadButton>button{border-radius:14px;min-height:44px;font-weight:800;
- border:2px solid rgba(255,255,255,.16)}
-.stButton>button[kind="primary"],.stFormSubmitButton>button[kind="primary"]{background:var(--sun);color:#1c1650;border-color:var(--sun)}
-.stButton>button:focus-visible{outline:3px solid #fff;outline-offset:2px}
-.nv-card{background:linear-gradient(160deg,var(--panel),#161a40);border:1px solid rgba(255,255,255,.10);border-radius:20px;
- padding:16px 18px;margin-bottom:6px;transition:transform .25s ease,box-shadow .25s ease;transform-style:preserve-3d}
-@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:perspective(900px) rotateX(2deg) translateY(-3px);box-shadow:0 18px 40px rgba(0,0,0,.4)}}
-.nv-card h4{margin:0 0 6px;font-size:1.18rem;line-height:1.3;color:#fff}
-.nv-meta{color:#b9b6e6;font-size:.85rem;margin-bottom:8px}
-.nv-sum{color:#e9e6ff;line-height:1.55;font-size:.98rem}
+iframe{border-radius:22px;border:0}
+.stButton>button,.stFormSubmitButton>button,.stDownloadButton>button{border-radius:14px;min-height:46px;font-weight:800;transition:transform .15s,box-shadow .15s}
+.stButton>button:hover,.stFormSubmitButton>button:hover{transform:translateY(-2px)}
+.stButton>button[kind="primary"],.stFormSubmitButton>button[kind="primary"]{background:linear-gradient(135deg,#5B3CFF,#8B5CF6);color:#fff;border:0;box-shadow:0 6px 16px rgba(91,60,255,.30)}
+.stButton>button:focus-visible{outline:3px solid var(--sun);outline-offset:2px}
+.nv-card{background:var(--card);border-radius:22px;padding:16px 18px 14px;margin-bottom:8px;border:1px solid var(--line);
+ border-top:6px solid var(--accent,#5B3CFF);box-shadow:var(--shadow);color:var(--ink);transition:transform .2s,box-shadow .2s}
+@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:translateY(-4px);box-shadow:0 16px 40px rgba(91,60,255,.18)}}
+.nv-card h4{margin:2px 0 6px;font-size:1.22rem;line-height:1.28;color:var(--ink)}
+.nv-meta{color:var(--muted);font-size:.86rem;margin-bottom:8px}
+.nv-sum{color:#2d2a5c;line-height:1.6}.nv-sum ul{list-style:none;margin:8px 0 0;padding:0}
+.nv-sum li{position:relative;padding-left:22px;margin-bottom:6px}.nv-sum li:before{content:"✦";position:absolute;left:0;color:var(--accent,#5B3CFF)}
 .chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.78rem;font-weight:800;margin:0 6px 6px 0}
-.chip.pos{background:rgba(61,220,151,.18);color:#3DDC97}.chip.neu{background:rgba(155,140,255,.2);color:#C9C0FF}
-.chip.neg{background:rgba(255,107,107,.2);color:#FF9A9A}.chip.cat{background:rgba(255,201,60,.16);color:#FFC93C}.chip.ok{background:rgba(61,220,151,.14);color:#3DDC97}
-.nv-sum ul{margin:6px 0 0 18px;padding:0}.nv-sum li{margin-bottom:5px}
-.trust{height:7px;border-radius:9px;background:rgba(255,255,255,.1);overflow:hidden;margin:2px 0 4px}
-.trust>i{display:block;height:100%;border-radius:9px}
-.nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:14px;margin-bottom:10px}
-.nv-stat{background:var(--panel);border-radius:18px;padding:14px 16px;border:1px solid rgba(255,255,255,.08)}
-.nv-stat b{font-family:'Baloo 2';font-size:1.8rem;color:var(--sun);display:block;line-height:1.1}
-.nv-note{background:rgba(155,140,255,.12);border-left:4px solid var(--lilac);border-radius:10px;padding:10px 14px;color:#dcd8ff;font-size:.92rem}
-
-.ticker{display:flex;align-items:center;background:var(--panel);border:1px solid rgba(255,255,255,.12);border-radius:14px;overflow:hidden;margin:8px 0 6px}
+.chip.cat{background:#FFF1C2;color:#7a5a00}.chip.pos{background:#D9F8EA;color:#0b7a53}.chip.neu{background:#ECE8FF;color:#4a3bb0}
+.chip.neg{background:#FFE0E0;color:#b3261e}.chip.ok{background:#D9F0FF;color:#0a5c8f}
+.trust{height:7px;border-radius:9px;background:#ECE8FF;overflow:hidden;margin:2px 0 4px}.trust>i{display:block;height:100%;border-radius:9px}
+.nv-thumb{width:100%;max-height:170px;object-fit:cover;border-radius:14px;margin-bottom:10px}
+.nv-stat{background:var(--card);border-radius:18px;padding:14px 16px;border:1px solid var(--line);box-shadow:var(--shadow);color:var(--ink)}
+.nv-stat b{font-family:'Baloo 2';font-size:1.8rem;color:var(--violet);display:block;line-height:1.1}
+.nv-note{background:#ECE8FF;border-left:5px solid var(--violet);border-radius:12px;padding:10px 14px;color:var(--ink);font-size:.95rem}
+.welcome{display:grid;grid-template-columns:1.25fr 1fr;gap:18px;background:linear-gradient(135deg,#fff,#F4EEFF);border:1px solid var(--line);
+ border-radius:24px;padding:18px 22px;box-shadow:var(--shadow);margin:6px 0 14px;color:var(--ink)}
+.welcome h2{margin:0 0 8px;font-size:1.7rem;color:var(--ink)}
+.pillrow span{display:inline-block;background:#fff;border:1px solid var(--line);border-radius:99px;padding:4px 12px;font-weight:800;font-size:.85rem;margin:0 6px 6px 0;color:var(--ink)}
+.mission{display:flex;gap:16px;align-items:center}.tasks{display:grid;gap:6px}.tasks small{color:var(--muted)}
+.task{display:flex;align-items:center;gap:10px;font-weight:700;font-size:.95rem}
+.task i{width:22px;height:22px;border-radius:50%;border:2px solid #cfc7ff;display:grid;place-items:center;font-style:normal;font-size:.8rem;flex:none}
+.task.done i{background:var(--mint);border-color:var(--mint);color:#fff}
+.ring{width:76px;height:76px;border-radius:50%;flex:none;background:conic-gradient(var(--violet) calc(var(--p)*1%),#E4DEFF 0);display:grid;place-items:center}
+.ring b{width:58px;height:58px;border-radius:50%;background:#fff;display:grid;place-items:center;font-family:'Baloo 2';font-size:1.15rem;color:var(--ink)}
+.daily{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.dcard{border-radius:20px;padding:14px 18px;color:var(--ink);border:1px solid var(--line);box-shadow:var(--shadow)}
+.dcard.fact{background:linear-gradient(135deg,#DFF4FF,#fff)}.dcard.word{background:linear-gradient(135deg,#FFF0B8,#fff)}
+.dcard small{font-weight:800;color:var(--violet);letter-spacing:.05em;text-transform:uppercase}.dcard p{margin:4px 0 0;line-height:1.55}
+.prof{background:linear-gradient(135deg,#5B3CFF,#8B5CF6);color:#fff;border-radius:20px;padding:14px 16px;margin:4px 0 12px}
+.prof .av{font-size:2rem;line-height:1}.prof b{font-family:'Baloo 2';font-size:1.2rem}
+.prof .bar{height:8px;border-radius:9px;background:rgba(255,255,255,.28);overflow:hidden;margin:8px 0 4px}.prof .bar i{display:block;height:100%;background:var(--sun);border-radius:9px}
+.prof small{opacity:.95}.prof .badges span{display:inline-block;background:rgba(255,255,255,.22);border-radius:99px;padding:2px 9px;margin:4px 4px 0 0;font-size:.78rem;font-weight:800}
+.feat span{display:inline-block;background:#fff;border:1px solid var(--line);border-radius:99px;padding:6px 14px;font-weight:800;margin:0 8px 8px 0;color:var(--ink);box-shadow:var(--shadow)}
+.ticker{display:flex;align-items:center;background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:8px 0 6px;box-shadow:var(--shadow)}
 .ticker .live{background:#FF4D4D;color:#fff;font-weight:800;padding:10px 14px;white-space:nowrap;animation:blinkdot 1.6s infinite}
 .trk{overflow:hidden;flex:1}.roll{display:inline-block;white-space:nowrap;animation:roll 110s linear infinite;padding:10px 0}
-.ticker:hover .roll{animation-play-state:paused}.tk{margin-right:56px;color:#e9e6ff}.tk b{color:#FFC93C;margin-right:6px}
+.ticker:hover .roll{animation-play-state:paused}.tk{margin-right:56px;color:var(--ink)}.tk b{color:var(--violet);margin-right:6px}
 @keyframes roll{to{transform:translateX(-50%)}}@keyframes blinkdot{50%{opacity:.75}}
 @media (prefers-reduced-motion:reduce){.roll,.ticker .live{animation:none}.trk{overflow-x:auto}}
-.nv-foot{text-align:center;color:#b9b6e6;font-size:.95rem;padding:22px 0 8px;border-top:1px solid rgba(255,255,255,.12);margin-top:30px;line-height:1.9}
-.nv-foot a{color:#FFC93C;font-weight:800;text-decoration:none;margin:0 10px;white-space:nowrap}.nv-foot .small{font-size:.8rem;opacity:.85}
-.stApp{background:radial-gradient(1100px 520px at 85% -8%,rgba(91,60,255,.22),transparent),radial-gradient(900px 480px at -10% 30%,rgba(255,201,60,.08),transparent),#0F1230}
-@media (max-width:640px){.block-container{padding:.6rem .6rem 4rem}.nv-card h4{font-size:1.05rem}}
-</style>""", unsafe_allow_html=True)
+.nv-foot{text-align:center;color:var(--muted);font-size:.95rem;padding:22px 0 8px;border-top:1px solid var(--line);margin-top:30px;line-height:1.9}
+.nv-foot a{color:var(--violet);font-weight:800;text-decoration:none;margin:0 10px;white-space:nowrap}.nv-foot .small{font-size:.8rem;opacity:.9}
+@media (max-width:700px){.welcome,.daily{grid-template-columns:1fr}.block-container{padding:.6rem .6rem 4rem}.nv-card h4{font-size:1.08rem}}
+</style>"""
+
+KIDS_CSS = r"""<style>
+.nv-card{border:3px solid var(--ink);border-top:10px solid var(--accent,#FF6B6B);box-shadow:6px 6px 0 var(--ink);border-radius:26px}
+.nv-card h4{font-size:1.36rem}.nv-sum{font-size:1.04rem}
+.welcome{border:3px solid var(--ink);box-shadow:6px 6px 0 var(--ink);background:linear-gradient(135deg,#FFF0B8,#FFD9E6)}
+.dcard{border:3px solid var(--ink);box-shadow:5px 5px 0 var(--ink)}
+.stApp{background:radial-gradient(circle at 8% 12%,rgba(255,201,60,.35) 0 14%,transparent 15%),radial-gradient(circle at 94% 22%,rgba(59,185,255,.28) 0 12%,transparent 13%),
+ radial-gradient(circle at 80% 90%,rgba(255,107,107,.22) 0 10%,transparent 11%),var(--bg)}
+</style>"""
+
+
+def inject_css():
+    size = {"Normal": 100, "Large": 115, "Extra large": 130}.get(st.session_state.get("tsize", "Normal"), 100)
+    st.markdown(BASE_CSS.replace("__SIZE__", str(size)) + (KIDS_CSS if st.session_state.get("kids") else ""),
+                unsafe_allow_html=True)
 
 
 HERO_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1498,21 +1653,75 @@ def hero():
     arts = st.session_state.get("articles") or DEMO_ARTICLES
     heads = [a["title"][:70] for a in arts[:7]]
     payload = json.dumps(heads).replace("</", "<\\/")
-    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__NAME__", esc(APP_NAME)).replace("__TAG__", esc(TAGLINE)), 300)
+    embed_html(HERO_HTML.replace("__HEADS__", payload).replace("__NAME__", esc(APP_NAME)).replace("__TAG__", esc(TAGLINE)), 250)
 
 
 # ----------------------------------------------------------------------------
 # Pages
 # ----------------------------------------------------------------------------
+def google_enabled():
+    try:
+        return "auth" in st.secrets
+    except Exception:
+        return False
+
+
+def google_session():
+    """If the person signed in with Google (Streamlit's built-in login), connect them to our account table."""
+    if st.session_state.get("user") or not google_enabled():
+        return
+    try:
+        if not st.user.is_logged_in:
+            return
+        email = (getattr(st.user, "email", "") or "").strip().lower()
+        gname = getattr(st.user, "name", "") or email.split("@")[0]
+    except Exception:
+        return
+    if not email:
+        return
+    rows = q("SELECT * FROM users WHERE email=?", (email,))
+    if rows:
+        set_user(rows[0], "google")
+        st.session_state.via_google = True
+    else:
+        st.session_state.google_new = {"email": email, "name": gname[:40]}
+
+
+def google_finish():
+    g = st.session_state["google_new"]
+    st.success(f"Signed in with Google as {g['email']}. One last step!")
+    with st.form("g_form"):
+        n = st.text_input("Nickname (no full names please)", value=g["name"], max_chars=40)
+        ag = st.selectbox("Age group", ["Under 13", "13 to 17", "18 or older"], index=2)
+        c = st.checkbox("A parent or guardian knows about this account and agrees (needed if under 18)")
+        if st.form_submit_button("Start reading", type="primary", width="stretch"):
+            if len(n.strip()) < 2:
+                st.error("Please enter a nickname with at least 2 letters.")
+            elif ag != "18 or older" and not c:
+                st.error("Please tick the box to confirm a parent or guardian agrees.")
+            else:
+                salt = secrets.token_hex(16)
+                new_id = x("INSERT INTO users(email,name,salt,pw_hash,age_group,created,last_login) VALUES(?,?,?,?,?,?,?)",
+                           (g["email"], n.strip()[:40], salt, hash_pw(secrets.token_urlsafe(24), salt), ag, iso(), iso()))
+                st.session_state.pop("google_new", None)
+                set_user(q("SELECT * FROM users WHERE id=?", (new_id,))[0], "google")
+                st.session_state.via_google = True
+                st.rerun()
+
+
 def auth_screen():
-    st.markdown(f"### Join {APP_NAME}")
-    st.caption("Log in to save stories, earn XP and keep your streak. Guests can explore with fewer AI helpers.")
+    st.markdown(f"### Welcome to {APP_NAME} 👋")
+    st.markdown('<div class="feat"><span>📰 Trusted news</span><span>🎨 Cartoon explainers</span><span>🎧 Listen to news</span>'
+                '<span>🌐 14 languages</span><span>🧸 Kid-safe</span></div>', unsafe_allow_html=True)
+    if google_enabled():
+        st.button("🔐 Continue with Google", on_click=st.login, type="primary", width="stretch")
+        st.caption("Fastest way: one tap, and you stay signed in on this device.")
     t1, t2, t3 = st.tabs(["Log in", "Sign up", "Just explore"])
     with t1:
         with st.form("login_form"):
             e = st.text_input("Email", key="li_e")
             p = st.text_input("Password", type="password", key="li_p")
-            keep = st.checkbox("Keep me logged in on this device", value=True, key="li_keep")
+            keep = st.checkbox("Keep me logged in for 30 days on this device", value=True, key="li_keep")
             if st.form_submit_button("Log in", type="primary", width="stretch"):
                 ok, res = login(e, p)
                 if ok:
@@ -1529,10 +1738,9 @@ def auth_screen():
             p = st.text_input("Password (8+ characters, letters and numbers)", type="password")
             ag = st.selectbox("Age group", ["Under 13", "13 to 17", "18 or older"], index=2)
             c = st.checkbox("A parent or guardian knows about this account and agrees (needed if under 18)")
-            keep = st.checkbox("Keep me logged in on this device", value=True, key="su_keep")
+            keep = st.checkbox("Keep me logged in for 30 days on this device", value=True, key="su_keep")
             st.caption("We keep your nickname, email, XP and what you save or ask, only to run the app. Your password is "
-                       "stored as a one-way hash. See the 🔒 Privacy page (after you log in). You can delete everything "
-                       "from My Space at any time.")
+                       "stored as a one-way hash. See the 🔒 Privacy page. You can delete everything from My Space at any time.")
             if st.form_submit_button("Create my account", type="primary", width="stretch"):
                 ok, res = signup(n, e, p, ag, c)
                 if ok:
@@ -1554,6 +1762,10 @@ def auth_screen():
             st.rerun()
 
 
+def badges_html(streak):
+    return "".join(f"<span>{ic} {nm}</span>" for d, ic, nm in STREAK_BADGES if (streak or 0) >= d)
+
+
 def sidebar():
     u = st.session_state.get("user")
     with st.sidebar:
@@ -1561,30 +1773,34 @@ def sidebar():
         if u:
             row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))[0]
             (lo, name, icon), nxt = level_of(row["xp"])
-            st.markdown(f"**Hi {esc(u['name'])}!** {icon} {name}")
-            if nxt:
-                st.progress(min(1.0, (row["xp"] - lo) / (nxt[0] - lo)), text=f"{row['xp']} / {nxt[0]} XP")
-            else:
-                st.caption(f"{row['xp']} XP · top level!")
-            st.caption(f"🔥 {row['streak']}-day streak")
+            pct = round(100 * min(1.0, (row["xp"] - lo) / (nxt[0] - lo))) if nxt else 100
+            more = f" · next level at {nxt[0]} XP" if nxt else " · top level!"
+            st.markdown(f'<div class="prof"><div class="av">{icon}</div><b>Hi {esc(u["name"])}!</b><br>'
+                        f'<small>{name} · 🔥 {row["streak"] or 0}-day streak</small><div class="bar"><i style="width:{pct}%"></i></div>'
+                        f'<small>{row["xp"]} XP{more}</small><div class="badges">{badges_html(row["streak"])}</div></div>',
+                        unsafe_allow_html=True)
         elif st.session_state.get("guest"):
-            st.caption("Exploring as guest")
+            st.info("Exploring as a guest. Log in to save XP, streaks and stories.")
         st.toggle("🧸 Kids Mode (safe stories, simple words)", key="kids")
-        st.selectbox("🌐 Translate summaries to", list(LANGS), key="lang")
+        with st.expander("⚙️ Settings"):
+            st.selectbox("🌐 Language", list(LANGS), key="lang")
+            st.select_slider("🔠 Text size", ["Normal", "Large", "Extra large"], key="tsize")
         if u or st.session_state.get("guest"):
             if st.button("Log out" if u else "Leave guest mode", width="stretch"):
                 end_session()
-                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev"):
+                google = st.session_state.get("via_google")
+                for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev", "via_google"):
                     st.session_state.pop(k, None)
+                if google:
+                    st.logout()
                 st.rerun()
-        with st.expander("🔧 Check connections"):
+        with st.expander("🔧 Help: check connections"):
             st.caption("Shows which parts (news, translation, AI, voice) are working.")
             if st.button("Run check", key="hc_btn"):
                 with st.spinner("Checking..."):
                     st.session_state.hc = health_check()
             for name, ok, detail in st.session_state.get("hc", []):
                 st.markdown(f"{ok} **{name}**  \n<small>{esc(detail)}</small>", unsafe_allow_html=True)
-        st.divider()
         st.caption("Credibility and sentiment are quick hints, not facts. Always open the source.")
 
 
@@ -1596,11 +1812,12 @@ def bullets(text, k=3):
 def card_html(a, summary, cat):
     s_label, s_emoji, s_cls = sentiment(a["title"] + ". " + a["text"])
     score, label, color, why = credibility(a)
+    accent = CAT_COLOR.get(cat, "#5B3CFF")
     img = f'<img class="nv-thumb" src="{esc(a["image"], True)}" alt="" loading="lazy">' if a.get("image") else ""
     by = f' · ✍️ {esc(a["author"])}' if a.get("author") else ""
     est = '<span class="chip ok">✅ Established outlet</span>' if a["source"] in OUTLETS or any(t in a["source"].lower() for t in TRUSTED_SOURCES) else ""
     lis = "".join(f"<li>{esc(b)}</li>" for b in bullets(summary))
-    return (f'<div class="nv-card">{img}<h4>{esc(a["title"])}</h4>'
+    return (f'<div class="nv-card" style="--accent:{accent}">{img}<h4>{esc(a["title"])}</h4>'
             f'<div class="nv-meta">{esc(a["source"])}{by} · {esc(time_ago(a["published"]))}</div>'
             f'<span class="chip cat">{esc(cat)}</span><span class="chip {s_cls}">{s_emoji} {s_label}</span>{est}'
             f'<div class="nv-sum"><ul>{lis}</ul></div>'
@@ -1728,16 +1945,15 @@ def ticker_html(arts):
     return f'<div class="ticker"><span class="live">🔴 LIVE</span><div class="trk"><div class="roll">{rows}{rows}</div></div></div>'
 
 
-def mission_card():
-    """Daily checklist: open 3 stories, watch a cartoon, finish a quiz (+20 XP when all are done)."""
+def welcome_card():
+    """Greeting, streak, badges and the daily mission (open 3 stories, watch a cartoon, finish a quiz)."""
     today = now().date().isoformat()
     who, val = ("user_id", uid()) if uid() else ("sid", st.session_state.sid)
 
     def count(kind):
         return q(f"SELECT COUNT(*) c FROM events WHERE kind=? AND {who}=? AND substr(ts,1,10)=?", (kind, val, today))[0]["c"]
     n_story, n_cartoon, n_quiz = count("studio"), count("cartoon"), count("quiz")
-    tasks = [(n_story >= 3, f"Open 3 stories ({min(n_story, 3)}/3)"), (n_cartoon >= 1, "Watch a cartoon"),
-             (n_quiz >= 1, "Finish a quiz")]
+    tasks = [(n_story >= 3, f"Open 3 stories ({min(n_story, 3)}/3)"), (n_cartoon >= 1, "Watch a cartoon"), (n_quiz >= 1, "Finish a quiz")]
     done = sum(1 for ok, _ in tasks if ok)
     if uid() and done == 3 and not q("SELECT 1 FROM events WHERE kind='mission' AND user_id=? AND substr(ts,1,10)=?", (uid(), today)):
         log("mission")
@@ -1745,10 +1961,49 @@ def mission_card():
         st.balloons()
     u = st.session_state.get("user")
     name = esc(u["name"]) if u else "friend"
-    c1, c2 = st.columns([3, 2])
-    c1.markdown(f"#### 👋 {greeting()}, {name}!")
-    c2.markdown(f"**🎯 Today's mission ({done}/3)**  \n" + "  \n".join(("✅ " if ok else "⬜ ") + t for ok, t in tasks))
-    c2.progress(done / 3, text="Complete all 3 for +20 XP" if done < 3 else "Mission complete! +20 XP 🎉")
+    chips, msg = "", "Log in to save your XP, streak and badges."
+    if u:
+        row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))[0]
+        (_, lvl, icon), _n = level_of(row["xp"])
+        stk = row["streak"] or 0
+        chips = f'<span>{icon} {lvl}</span><span>🔥 {stk}-day streak</span><span>⭐ {row["xp"]} XP</span>'
+        left = 7 - stk
+        msg = (f"Come back {left} more day{'s' if left != 1 else ''} in a row to earn the 🥇 Week Warrior badge!"
+               if left > 0 else "You're a Week Warrior 🥇! Keep going for the 💎 badge at 14 days.")
+    rows = "".join(f'<div class="task {"done" if ok else ""}"><i>{"✓" if ok else ""}</i>{esc(t)}</div>' for ok, t in tasks)
+    st.markdown(
+        f'<div class="welcome"><div><h2>👋 {greeting()}, {name}!</h2><div class="pillrow">{chips}</div>'
+        f'<div class="nv-meta">{esc(msg)}</div></div>'
+        f'<div class="mission"><div class="ring" style="--p:{round(done / 3 * 100)}"><b>{done}/3</b></div>'
+        f'<div class="tasks"><b>🎯 Today\'s mission</b>{rows}<small>All 3 = +20 XP</small></div></div></div>',
+        unsafe_allow_html=True)
+
+
+def daily_band():
+    day = now().date().toordinal()
+    fact, (word, meaning) = FACTS[day % len(FACTS)], WORDS[day % len(WORDS)]
+    code = LANGS[st.session_state.lang][0]
+    if code != "en":
+        try:
+            fact, meaning = translate(fact, code), translate(meaning, code)
+        except Exception:
+            pass
+    st.markdown(f'<div class="daily"><div class="dcard fact"><small>💡 Did you know?</small><p>{esc(fact)}</p></div>'
+                f'<div class="dcard word"><small>📖 Word of the day</small><p><b>{esc(word)}</b>: {esc(meaning)}</p></div></div>',
+                unsafe_allow_html=True)
+
+
+def bulletin(arts):
+    """Audio news: the top 5 headlines read aloud in the chosen language."""
+    code = LANGS[st.session_state.lang][0]
+    text = f"Here are today's top stories on {APP_NAME}. " + " ".join(f"Story {i}. {a['title']}." for i, a in enumerate(arts[:5], 1))
+    if code != "en":
+        try:
+            text = translate(text, code)
+        except Exception:
+            st.info("Translation is busy, so the audio is in English.")
+            code = "en"
+    st.audio(base64.b64decode(tts_b64(text, code, "Newsie")), format="audio/mp3")
 
 
 @st.fragment
@@ -1780,15 +2035,20 @@ def story_cards(arts, summaries, cat):
 def page_news():
     kids = st.session_state.kids
     cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
-    mission_card()
+    if is_admin() and not using_pg():
+        st.warning("⚠️ Owner notice: the database is temporary, so accounts and logins are lost when the app restarts. "
+                   "Add DATABASE_URL in Secrets (free Neon database).")
+    welcome_card()
+    daily_band()
     opts = [f"{CAT_EMOJI.get(c, '📰')} {c}" for c in cats]
     with st.form("news_form"):
         pick = st.pills("Pick a topic", opts, selection_mode="single", default=opts[0], key="cat_pill")
         query = st.text_input("Or search anything", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
-        c3, c4, c5 = st.columns(3)
-        source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
-        fresh = c4.selectbox("How fresh?", list(FRESH))
-        n = c5.slider("Stories", 5, 50, 20)
+        with st.expander("⚙️ More filters: source, freshness, how many"):
+            c3, c4, c5 = st.columns(3)
+            source = c3.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
+            fresh = c4.selectbox("How fresh?", list(FRESH))
+            n = c5.slider("Stories", 5, 50, 20)
         go = st.form_submit_button("🔎 Get latest news", type="primary", width="stretch")
     cat = (pick or opts[0]).split(" ", 1)[1]
     first = "articles" not in st.session_state
@@ -1808,6 +2068,12 @@ def page_news():
         upd = st.session_state.get("updated")
         when = (upd + dt.timedelta(hours=5, minutes=30)).strftime("%I:%M %p") if upd else ""
         st.caption(f"🕒 Updated {when} IST · {len(arts)} stories from {len({a['source'] for a in arts})} sources · newest first")
+        if st.button("🎧 Listen to the top 5 headlines", key="bulletin_btn"):
+            with st.spinner("Preparing your audio news..."):
+                try:
+                    bulletin(live)
+                except Exception as e:
+                    st.info(f"Audio isn't available right now ({type(e).__name__}).")
     if kids:
         st.markdown('<div class="nv-note">🧸 Kids Mode is on: gentle stories only, simple explanations and comics.</div>',
                     unsafe_allow_html=True)
@@ -1841,30 +2107,39 @@ def keyword_answer(question):
         if sc > score:
             best, score = a, sc
     if best:
-        return (f"I found this in today's stories:\n\n**{best['title']}**\n\n{short_summary(best, 300)}\n\n"
-                "_(Add an AI key in settings and I can answer in more detail.)_")
-    return ("I can look up word meanings (try: *define inflation*). " + ai_status())
+        return (f"I found this in today's stories:\n\n**{best['title']}**\n\n{short_summary(best, 300)}\n\n_({ai_status()})_")
+    return "I can look up words and topics (try: *define inflation* or *what is GDP*). " + ai_status()
 
 
 def newsie_reply(question):
     kids = st.session_state.kids
+    if kids and KIDS_TOPIC_BLOCK.search(question):
+        return ("That's a topic for grown-ups to explain, so please ask a parent or teacher. "
+                "Try asking me about space, animals, science or sports instead! 🚀")
     word = dictionary_intent(question)
     if word:
-        d = define(word)
+        d = lookup(word)
         if d:
             return d
-    if not ai_enabled():
-        return keyword_answer(question)
-    if not ai_allowed():
-        return "You've used all your AI helpers for today. They refresh tomorrow. Meanwhile, try word meanings like *define economy*."
-    heads = "\n".join("- " + a["title"] for a in st.session_state.get("articles", [])[:8])
-    system = (SYSTEM_BASE + f" You are chatting with {audience(kids)}. You can explain words and news topics. "
-              "You cannot browse the internet; today's headlines on screen are listed below. If unsure, say so and "
-              "suggest checking trusted sources. Never ask for personal details. Politely steer away from adult or "
-              "harmful topics. Keep answers under 120 words.\nHeadlines:\n" + heads)
-    hist = [m for m in st.session_state.chat[-8:]] + [{"role": "user", "content": question}]
-    out = llm(system, hist, 450)
-    return out or keyword_answer(question)
+    out = None
+    if ai_on() and ai_allowed():
+        heads = "\n".join("- " + a["title"] for a in st.session_state.get("articles", [])[:8])
+        system = (SYSTEM_BASE + f" You are chatting with {audience(kids)}. You can explain words and news topics. "
+                  "You cannot browse the internet; today's headlines on screen are listed below. If unsure, say so and "
+                  "suggest checking trusted sources. Never ask for personal details. Never give instructions for weapons "
+                  "or anything harmful, and politely steer away from adult topics. Keep answers under 120 words.\nHeadlines:\n" + heads)
+        hist = [m for m in st.session_state.chat[-8:]] + [{"role": "user", "content": question}]
+        out = llm(system, hist, 450)
+    elif ai_on():
+        return "You've used all your AI helpers for today. They refresh tomorrow. Meanwhile try *define economy* or *what is GDP*."
+    if out:
+        return out
+    topic = whatis_intent(question)
+    if topic:
+        d = lookup(topic)
+        if d:
+            return d + (f"\n\n_({ai_status()})_" if ai_on() else "")
+    return keyword_answer(question)
 
 
 def page_ask():
@@ -1909,6 +2184,7 @@ def page_space():
     c1.markdown(f'<div class="nv-stat"><b>{row["xp"]}</b>XP earned</div>', unsafe_allow_html=True)
     c2.markdown(f'<div class="nv-stat"><b>{row["streak"]} 🔥</b>day streak</div>', unsafe_allow_html=True)
     c3.markdown(f'<div class="nv-stat"><b>{icon}</b>{name}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="pillrow">{badges_html(row["streak"]) or "<span>🎖️ Log in 3 days in a row to earn your first badge</span>"}</div>', unsafe_allow_html=True)
     st.markdown("#### 🔖 Saved stories")
     saved = q("SELECT id,title,url,summary FROM saved WHERE user_id=? ORDER BY id DESC LIMIT 50", (u["id"],))
     if not saved:
@@ -2025,33 +2301,6 @@ def page_admin():
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
-def health_check():
-    rows = []
-
-    def t(name, fn):
-        try:
-            rows.append((name, "✅", str(fn())[:90]))
-        except Exception as e:
-            rows.append((name, "❌", f"{type(e).__name__}: {str(e)[:140]}"))
-
-    def ai_test():
-        if not ai_on():
-            raise RuntimeError("No GEMINI_API_KEY / ANTHROPIC_API_KEY found in Secrets")
-        return "replied: " + _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
-
-    def voice_test():
-        from gtts import gTTS
-        gTTS(text="hello", lang="en").write_to_fp(io.BytesIO())
-        return "server voice works"
-
-    t("News feeds", lambda: f"{len(fetch_rss(None, 'Top stories'))} stories from Bing/Google")
-    t("Translation (Hindi)", lambda: _tr("Good morning friends", "hi"))
-    t("Dictionary", lambda: (define("economy") or "no result").split("\n")[0])
-    t("AI helper", ai_test)
-    t("Clear voice (gTTS)", voice_test)
-    return rows
-
-
 def footer():
     gh = cfg("GITHUB_URL", "https://github.com/keerthanam01-nov")
     mail = cfg("CONTACT_EMAIL", "keerthanam8073@gmail.com")
@@ -2128,7 +2377,8 @@ def health_check():
     def ai_test():
         if not ai_on():
             raise RuntimeError("No GEMINI_API_KEY / ANTHROPIC_API_KEY found in Secrets")
-        return "replied: " + _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
+        out = _call_llm("Reply with one word.", [{"role": "user", "content": "Say OK"}], 20).strip()[:20]
+        return f"working (model: {_model_state()['ok'] or 'Claude'}) replied: {out}"
 
     def voice_test():
         from gtts import gTTS
@@ -2141,10 +2391,13 @@ def health_check():
             futs = {nm: ex.submit(fetch_outlet, nm, "Top stories") for nm in OUTLETS}
             for nm, f in futs.items():
                 try:
-                    (ok if f.result(timeout=10) else bad).append(nm)
-                except Exception:
-                    bad.append(nm)
-        return f"{len(ok)}/{len(OUTLETS)} outlets reachable" + (f" · down: {', '.join(bad)}" if bad else "")
+                    if f.result(timeout=10):
+                        ok.append(nm)
+                    else:
+                        bad.append(f"{nm} (empty)")
+                except Exception as e:
+                    bad.append(f"{nm} ({type(e).__name__} {str(e)[:40]})")
+        return f"{len(ok)}/{len(OUTLETS)} outlets reachable" + (f" · down: {'; '.join(bad)}" if bad else "")
 
     def db_test():
         q("SELECT 1 AS ok")
@@ -2169,7 +2422,9 @@ def main():
     st.session_state.setdefault("sid", secrets.token_hex(6))
     st.session_state.setdefault("kids", False)
     st.session_state.setdefault("lang", "English")
+    st.session_state.setdefault("tsize", "Normal")
     restore_session()
+    google_session()
     if "kids_set" in st.session_state:
         st.session_state.kids = st.session_state.pop("kids_set")
     inject_css()
@@ -2184,6 +2439,10 @@ def main():
         ls_helper("save", tok)
         st.session_state.ls_saved = True
     if not user and not guest:
+        if st.session_state.get("google_new"):
+            google_finish()
+            footer()
+            return
         if st.session_state.pop("ls_clear", False):
             ls_helper("clear")
         elif not tok:
