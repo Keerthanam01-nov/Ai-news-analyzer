@@ -131,7 +131,7 @@ DEMO_ARTICLES = [
 ]
 
 st.set_page_config(page_title=f"{APP_NAME} - understand the news", page_icon="📰",
-                   layout="wide", initial_sidebar_state="collapsed")
+                   layout="wide", initial_sidebar_state="expanded")
 
 
 def embed_html(markup, height):
@@ -357,26 +357,29 @@ def finish_reset(email, code, new_pw):
     ok, msg = pw_ok(new_pw)
     if not ok:
         return False, msg
-    bad = "That code is wrong or has expired. Please request a new one."
-    rows = q("SELECT * FROM resets WHERE email=?", (email,))
-    if not rows:
-        return False, bad
-    r = rows[0]
-    if r["expires"] < iso() or (r["tries"] or 0) >= 5:
-        x("DELETE FROM resets WHERE email=?", (email,))
-        return False, bad
-    if not hmac.compare_digest(_th(email + ":" + code), r["code_hash"]):
-        x("UPDATE resets SET tries=tries+1 WHERE email=?", (email,))
-        return False, bad
+    bad = "That code is wrong or has expired. Request a fresh code first (see the steps above)."
     urows = q("SELECT id FROM users WHERE email=?", (email,))
     if not urows:
-        return False, bad
+        return False, "No account was found for that email. Use the Sign up tab to create one."
+    key = cfg("OWNER_RESET_KEY")
+    owner = bool(key) and email in admin_emails() and hmac.compare_digest(code.encode(), key.encode())
+    if not owner:
+        rows = q("SELECT * FROM resets WHERE email=?", (email,))
+        if not rows:
+            return False, bad
+        r = rows[0]
+        if r["expires"] < iso() or (r["tries"] or 0) >= 5:
+            x("DELETE FROM resets WHERE email=?", (email,))
+            return False, bad
+        if not hmac.compare_digest(_th(email + ":" + code), r["code_hash"]):
+            x("UPDATE resets SET tries=tries+1 WHERE email=?", (email,))
+            return False, bad
     salt = secrets.token_hex(16)
     x("UPDATE users SET salt=?, pw_hash=?, failed=0, locked_until=NULL WHERE id=?",
       (salt, hash_pw(new_pw, salt), urows[0]["id"]))
     x("DELETE FROM sessions WHERE user_id=?", (urows[0]["id"],))
     x("DELETE FROM resets WHERE email=?", (email,))
-    return True, "Password changed. You can log in now."
+    return True, "Password changed. Open the Log in tab and sign in."
 
 
 def set_user(row, kind="login"):
@@ -1537,94 +1540,65 @@ def local_quiz(a):
 # UI: styling and 3D hero
 # ----------------------------------------------------------------------------
 def inject_css(kids=False):
-    accent = "#FF9F1C" if kids else "#FFB020"
     size = {"Normal": "100%", "Large": "112%", "Extra large": "125%"}.get(st.session_state.get("tsize", "Normal"), "100%")
-    page_bg = "linear-gradient(180deg,#FFF1C9 0,#F5F6FB 340px)" if kids else "linear-gradient(180deg,#E7E5FF 0,#F5F6FB 380px)"
     css = """
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
-html{font-size:__SIZE__;color-scheme:light only}
-:root{--ink:#16143A;--muted:#55527A;--bg:#F5F6FB;--soft:#EEF0FF;--line:#D9DCF2;--brand:#5B3DF5;--brand2:#8B6CFF;--teal:#0FB5A6;--sun:__ACCENT__}
+html{font-size:__SIZE__}
+:root{--ink:#F2F3FA;--muted:#AEB3D6;--card:#171A30;--card2:#1F2340;--line:#2E3358;--brand:#FF5C5C;--brand2:#FF8A3D;--violet:#8B6CFF}
 html,body,.stApp,[data-testid="stMarkdownContainer"],input,textarea,button,label{font-family:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',sans-serif!important}
-.stApp,[data-testid="stAppViewContainer"],[data-testid="stMain"]{background:__BG__!important;color:var(--ink)!important}
-.block-container{max-width:1120px;padding:.8rem 1rem 4rem}
-[data-testid="stSidebar"],[data-testid="stSidebar"]>div{background:var(--soft)!important}
-/* top Streamlit bar: Share, GitHub, Stop, menu are always readable */
-html body .stApp [data-testid="stHeader"]{background:rgba(255,255,255,.97)!important;border-bottom:1px solid var(--line);box-shadow:0 1px 8px rgba(40,30,120,.06)}
-html body .stApp [data-testid="stHeader"] *{color:var(--ink)!important;fill:var(--ink)!important}
-/* text */
-.stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp h5,.stApp h6{color:var(--ink)!important;letter-spacing:-.01em;font-weight:800}
-.stApp [data-testid="stMarkdownContainer"] p,.stApp [data-testid="stMarkdownContainer"] li,.stApp [data-testid="stWidgetLabel"] p,
-.stApp [data-testid="stWidgetLabel"] label,.stApp label p,.stApp label span,.stApp [data-testid="stRadio"] label div{color:var(--ink)!important;opacity:1!important}
-.stApp [data-testid="stCaptionContainer"],.stApp [data-testid="stCaptionContainer"] *{color:var(--muted)!important;opacity:1!important}
-.stApp [data-testid="stAlert"] p,.stApp [data-testid="stAlert"] div,.stApp [data-testid="stAlert"] li{color:var(--ink)!important}
-/* inputs, dropdowns */
-.stApp input,.stApp textarea{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important;background:#fff!important;caret-color:var(--brand)}
-.stApp ::placeholder{color:#6B678F!important;opacity:1!important;-webkit-text-fill-color:#6B678F!important}
-.stApp [data-baseweb="select"]>div,.stApp [data-baseweb="input"]>div,.stApp [data-baseweb="textarea"],.stApp [data-baseweb="base-input"]{
- background:#fff!important;border:1.5px solid var(--line)!important;border-radius:12px!important}
-.stApp [data-baseweb="select"] *{color:var(--ink)!important;-webkit-text-fill-color:var(--ink)!important}
-.stApp [data-baseweb="select"] svg{fill:var(--ink)!important}
-[data-baseweb="popover"],[data-baseweb="popover"] *,[data-baseweb="menu"],[data-baseweb="menu"] *,[role="listbox"],[role="listbox"] *{color:var(--ink)!important;background-color:#fff!important}
-[role="option"]:hover,[role="option"][aria-selected="true"]{background-color:var(--soft)!important}
-/* chat */
-[data-testid="stBottom"],[data-testid="stBottom"]>div{background:var(--bg)!important}
-[data-testid="stChatInput"]{background:#fff!important;border:2px solid var(--brand)!important;border-radius:16px}
-[data-testid="stChatInput"] *{color:var(--ink)!important}
-[data-testid="stChatInput"] textarea{-webkit-text-fill-color:var(--ink)!important}
-[data-testid="stChatMessage"]{background:#fff!important;border:1px solid var(--line);border-radius:16px;margin-bottom:8px}
-[data-testid="stExpander"]{background:#fff!important;border:1px solid var(--line)!important;border-radius:14px}
-[data-testid="stExpander"] summary,[data-testid="stExpander"] summary *{color:var(--ink)!important}
-div[role="dialog"]{background:#fff!important;color:var(--ink)!important}
-[data-testid="stVerticalBlockBorderWrapper"]{border-color:var(--line)!important;border-radius:16px!important;background:#fff}
-.stApp [data-baseweb="tab"] p{color:var(--ink)!important;font-weight:800}
-.stApp [data-baseweb="tab-highlight"]{background:var(--brand)!important}
+.stApp{background:linear-gradient(180deg,#1B1750 0,#0E1020 480px)!important}
+.block-container{max-width:1180px;padding:1rem 1.2rem 4rem}
+[data-testid="stHeader"]{background:transparent!important}
+[data-testid="stSidebar"],[data-testid="stSidebar"]>div{background:#12142A!important}
+[data-testid="stSidebar"]{border-right:1px solid var(--line)}
+.stApp ::placeholder{color:#8B90B8!important;opacity:1!important}
+.stApp h1,.stApp h2,.stApp h3,.stApp h4{font-weight:800;letter-spacing:-.01em}
+[data-testid="stForm"]{border:1px solid var(--line)!important;border-radius:16px!important;background:#12142A}
+[data-testid="stExpander"]{background:var(--card)!important;border:1px solid var(--line)!important;border-radius:14px}
+[data-testid="stChatMessage"]{background:var(--card)!important;border:1px solid var(--line);border-radius:16px;margin-bottom:8px}
+[data-testid="stVerticalBlockBorderWrapper"]{border-color:var(--line)!important;border-radius:16px!important}
+div[role="dialog"]{background:#12142A!important}
 /* buttons */
-html body .stApp .stButton>button,html body .stApp .stDownloadButton>button,html body .stApp [data-testid^="stBaseLinkButton"],
-html body .stApp [data-testid="stBaseButton-secondary"]{background:#fff!important;color:var(--ink)!important;border:1.5px solid var(--line)!important;
- border-radius:12px!important;min-height:42px;font-weight:700;box-shadow:0 1px 2px rgba(40,30,120,.06);transition:transform .15s ease,border-color .15s ease}
+html body .stApp .stButton>button,html body .stApp .stDownloadButton>button,html body .stApp [data-testid^="stBaseLinkButton"],html body .stApp [data-testid="stBaseButton-secondary"]{
+ background:var(--card)!important;color:var(--ink)!important;border:1.5px solid var(--line)!important;border-radius:12px!important;min-height:42px;font-weight:700;transition:transform .15s ease,border-color .15s ease}
 html body .stApp .stButton>button *,html body .stApp .stDownloadButton>button *,html body .stApp [data-testid^="stBaseLinkButton"] *{color:var(--ink)!important}
-html body .stApp .stButton>button:hover,html body .stApp [data-testid^="stBaseLinkButton"]:hover{border-color:var(--brand)!important;background:var(--soft)!important;transform:translateY(-1px)}
+html body .stApp .stButton>button:hover,html body .stApp [data-testid^="stBaseLinkButton"]:hover{border-color:var(--brand)!important;transform:translateY(-1px)}
 html body .stApp .stButton>button[data-testid="stBaseButton-primary"],html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-primaryFormSubmit"]{
- background:linear-gradient(135deg,var(--brand),var(--brand2))!important;border:0!important;color:#fff!important}
+ background:linear-gradient(135deg,var(--brand),var(--brand2))!important;border:0!important}
 html body .stApp .stButton>button[data-testid="stBaseButton-primary"] *,html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-primaryFormSubmit"] *{color:#fff!important}
-html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"],html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"] *{color:var(--ink)!important;background:#fff!important}
-/* pills and menu */
-html body .stApp [data-testid="stPills"] button,html body .stApp [data-testid="stSegmentedControl"] button{background:#fff!important;border:1.5px solid var(--line)!important;border-radius:99px!important}
+html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"]{background:var(--card)!important}
+html body .stApp .stFormSubmitButton>button[data-testid="stBaseButton-secondaryFormSubmit"] *{color:var(--ink)!important}
+/* pills and top menu */
+html body .stApp [data-testid="stPills"] button,html body .stApp [data-testid="stSegmentedControl"] button{background:var(--card)!important;border:1.5px solid var(--line)!important}
+html body .stApp [data-testid="stPills"] button{border-radius:99px!important}
+html body .stApp [data-testid="stSegmentedControl"] button{border-radius:12px!important}
 html body .stApp [data-testid="stPills"] button *,html body .stApp [data-testid="stSegmentedControl"] button *{color:var(--ink)!important;opacity:1!important}
 html body .stApp [data-testid="stPills"] button[data-testid="stBaseButton-pillsActive"],
 html body .stApp [data-testid="stSegmentedControl"] button[data-testid="stBaseButton-segmented_controlActive"]{background:var(--brand)!important;border-color:var(--brand)!important}
 html body .stApp [data-testid="stPills"] button[data-testid="stBaseButton-pillsActive"] *,
 html body .stApp [data-testid="stSegmentedControl"] button[data-testid="stBaseButton-segmented_controlActive"] *{color:#fff!important}
-/* brand bar */
-.nv-brand{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:linear-gradient(120deg,#1B1747 0%,#3B2BB5 60%,#5B3DF5 100%);
- border-radius:18px;padding:12px 18px;margin:2px 0 10px;box-shadow:0 8px 24px rgba(40,30,140,.22)}
-.nv-brand .logo{width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.16);display:grid;place-items:center;font-size:1.4rem}
-.nv-brand b{color:#fff!important;font-size:1.15rem;display:block;line-height:1.2}
-.nv-brand small{color:#DAD6FF!important;font-size:.8rem}
-.nv-brand .sp{flex:1}
-.nv-brand .live{color:#fff!important;background:rgba(255,255,255,.16);padding:4px 10px;border-radius:99px;font-size:.74rem;font-weight:800}
-.nv-brand .usr{color:#fff!important;background:rgba(255,255,255,.22);padding:5px 12px;border-radius:99px;font-size:.82rem;font-weight:700}
 /* cards */
-.nv-card{background:#fff;border:1px solid var(--line);border-left:6px solid var(--cc,#FFB020);border-radius:18px;padding:16px 18px;margin-bottom:6px;
- box-shadow:0 4px 16px rgba(60,50,150,.08);transition:transform .22s ease,box-shadow .22s ease}
-@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:translateY(-3px);box-shadow:0 14px 30px rgba(60,50,150,.16)}}
-.nv-card h4{margin:0 0 6px;font-size:1.08rem;line-height:1.3;color:var(--ink)!important}
+.nv-side-brand{font-size:1.3rem;margin:4px 0 10px;color:#fff}
+.nv-card{background:var(--card);border:1px solid var(--line);border-left:6px solid var(--cc,#FFB020);border-radius:18px;padding:16px 18px;margin-bottom:6px;
+ box-shadow:0 6px 20px rgba(0,0,0,.28);transition:transform .22s ease,box-shadow .22s ease}
+@media (hover:hover) and (prefers-reduced-motion:no-preference){.nv-card:hover{transform:translateY(-3px);box-shadow:0 16px 34px rgba(0,0,0,.4)}}
+.nv-card h4{margin:0 0 6px;font-size:1.08rem;line-height:1.3;color:#fff}
 .nv-meta{color:var(--muted);font-size:.84rem;margin-bottom:8px}
-.nv-sum{color:var(--ink);line-height:1.55;font-size:.95rem}
+.nv-sum{color:#E6E8F7;line-height:1.55;font-size:.95rem}
 .chip{display:inline-block;padding:3px 11px;border-radius:99px;font-size:.76rem;font-weight:800;margin:0 6px 6px 0}
-.chip.pos{background:#DFF8EC;color:#0B7A55}.chip.neu{background:#E9E6FF;color:#4B35C9}.chip.neg{background:#FFE3E3;color:#B42318}
-.chip.cat{background:#FFF1C2;color:#7A4E00}.chip.ok{background:#DFF8EC;color:#0B7A55}
+.chip.pos,.chip.ok{background:#123B2D;color:#6BE8B0}.chip.neu{background:#2B2866;color:#CFC8FF}.chip.neg{background:#4D1F27;color:#FF9FA9}
+.chip.cat{background:#4A3A0E;color:#FFD66B}
 .chip.new{background:#E02424;color:#fff;animation:nvpulse 1.6s ease-in-out infinite}
 @keyframes nvpulse{50%{transform:scale(1.07)}}
 .nv-sum ul{margin:6px 0 0 18px;padding:0}.nv-sum li{margin-bottom:5px}
-.trust{height:7px;border-radius:9px;background:#E9E6FF;overflow:hidden;margin:2px 0 4px}
+.trust{height:7px;border-radius:9px;background:#2E3358;overflow:hidden;margin:2px 0 4px}
 .trust>i{display:block;height:100%;border-radius:9px}
 .nv-thumb{width:100%;max-height:150px;object-fit:cover;border-radius:12px;margin-bottom:10px}
-.nv-stat{background:#fff;border-radius:16px;padding:14px 16px;border:1px solid var(--line);color:var(--ink);box-shadow:0 3px 10px rgba(60,50,150,.06)}
-.nv-stat b{font-size:1.7rem;color:var(--brand);display:block;line-height:1.1}
-.nv-note{background:#EEF0FF;border-left:4px solid var(--brand);border-radius:10px;padding:10px 14px;color:var(--ink);font-size:.92rem}
-.nv-tick{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#E02424,#FF7A45);border-radius:14px;padding:7px 10px;margin:2px 0 6px;overflow:hidden}
+.nv-stat{background:var(--card);border-radius:16px;padding:14px 16px;border:1px solid var(--line);color:var(--ink)}
+.nv-stat b{font-size:1.7rem;color:#FF9A9A;display:block;line-height:1.1}
+.nv-note{background:var(--card);border-left:4px solid var(--brand);border-radius:10px;padding:10px 14px;color:var(--ink);font-size:.92rem}
+.nv-tick{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,#C81E1E,#FF7A45);border-radius:14px;padding:7px 10px;margin:2px 0 6px;overflow:hidden}
 .nv-tick b{background:#fff;color:#C81E1E;padding:2px 10px;border-radius:99px;font-size:.78rem;white-space:nowrap}
 .nv-track{overflow:hidden;flex:1}
 .nv-run{display:inline-block;white-space:nowrap;animation:nvrun 160s linear infinite;color:#fff!important;font-weight:700}
@@ -1632,16 +1606,16 @@ html body .stApp [data-testid="stSegmentedControl"] button[data-testid="stBaseBu
 .nv-run:hover{animation-play-state:paused}
 @keyframes nvrun{to{transform:translateX(-50%)}}
 @media (prefers-reduced-motion:reduce){.nv-run{animation:none}.nv-track{overflow-x:auto}.nv-card:hover{transform:none}}
-.nv-mission{background:#fff;border:1.5px dashed #F0A500;border-radius:14px;padding:9px 14px;margin:6px 0 8px;font-weight:700;color:var(--ink)}
-.nv-feat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:6px 0 12px}
-.nv-feat>div{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px 8px;text-align:center;font-weight:800;font-size:.9rem;color:var(--ink);box-shadow:0 3px 10px rgba(60,50,150,.06)}
+.nv-mission{background:var(--card);border:1.5px dashed #F0A500;border-radius:14px;padding:9px 14px;margin:6px 0 8px;font-weight:700;color:var(--ink)}
+.nv-feat{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:8px 0 12px}
+.nv-feat>div{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 8px;text-align:center;font-weight:800;font-size:.9rem;color:var(--ink)}
 .nv-feat span{display:block;font-size:1.5rem}
 .nv-feat small{display:block;font-weight:600;color:var(--muted);margin-top:2px;font-size:.76rem}
 .nv-foot{text-align:center;margin-top:34px;padding:18px 10px 6px;border-top:1px solid var(--line);font-size:.9rem;line-height:1.8;color:var(--ink)}
-.nv-foot a{font-weight:800;text-decoration:none;margin:0 6px;color:var(--brand)}
-@media (max-width:640px){.block-container{padding:.5rem .6rem 4rem}.nv-card h4{font-size:1rem}.nv-brand{padding:10px 12px}}
+.nv-foot a{font-weight:800;text-decoration:none;margin:0 6px;color:#FF9A9A}
+@media (max-width:640px){.block-container{padding:.5rem .6rem 4rem}.nv-card h4{font-size:1rem}}
 </style>"""
-    st.markdown(css.replace("__ACCENT__", accent).replace("__SIZE__", size).replace("__BG__", page_bg), unsafe_allow_html=True)
+    st.markdown(css.replace("__SIZE__", size), unsafe_allow_html=True)
 
 
 HERO_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1815,65 +1789,153 @@ def features_html():
     return f'<div class="nv-feat">{tiles}</div>'
 
 
-def brand_bar():
-    u = st.session_state.get("user")
-    chip = ""
-    if u:
-        row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))
-        if row:
-            (lo, name, icon), _ = level_of(row[0]["xp"])
-            chip = f'<span class="usr">{icon} {esc(u["name"])} · {row[0]["xp"]} XP · 🔥 {row[0]["streak"]}</span>'
-    elif st.session_state.get("guest"):
-        chip = '<span class="usr">👤 Guest</span>'
-    st.markdown(f'<div class="nv-brand"><div class="logo">📰</div><div><b>{esc(APP_NAME)}</b>'
-                f'<small>Understand any news, in your language, at your level</small></div>'
-                f'<div class="sp"></div><span class="live">● LIVE</span>{chip}</div>', unsafe_allow_html=True)
-
-
 def do_logout():
     end_session()
     for k in ("user", "guest", "articles", "chat", "awarded", "kids_prev", "mission", "last_page"):
         st.session_state.pop(k, None)
 
 
-def top_bar():
-    """One tidy row of controls. Choices are remembered in the page address."""
-    signed = st.session_state.get("user") or st.session_state.get("guest")
-    with st.container(border=True):
-        c1, c2, c3, c4 = st.columns([2.2, 1.4, 1.7, 1.1], vertical_alignment="bottom")
-        c1.selectbox("🌐 Language", list(LANGS), key="lang")
-        c2.selectbox("🔠 Text size", TEXT_SIZES, key="tsize")
-        c3.toggle("🧸 Kids Mode", key="kids", help="Safer stories and simpler words. Turn it off for the full news experience.")
-        if signed and c4.button("Log out" if st.session_state.get("user") else "Exit guest", key="top_logout", width="stretch"):
-            do_logout()
-            st.rerun()
+LOGIN_CHARS_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:transparent;font-family:'Baloo 2',system-ui,sans-serif}
+.stage{height:100%;border-radius:24px;background:linear-gradient(160deg,#2B2A8F 0%,#5B3DF5 55%,#FF5C8A 135%);position:relative;overflow:hidden;
+ display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:16px;box-shadow:0 14px 40px rgba(0,0,0,.35)}
+.fl{position:absolute;font-size:28px;opacity:.8;animation:fl 6s ease-in-out infinite}
+.fl:nth-child(1){left:8%;top:12%}.fl:nth-child(2){right:10%;top:18%;animation-delay:-2s}.fl:nth-child(3){left:14%;top:46%;animation-delay:-4s}.fl:nth-child(4){right:8%;top:50%;animation-delay:-1s}
+@keyframes fl{50%{transform:translateY(-14px) rotate(8deg)}}
+.chars{display:flex;gap:6px;justify-content:center;align-items:flex-end;width:100%}
+.ch{width:min(44%,175px);height:auto;overflow:visible;animation:bob 3.2s ease-in-out infinite}
+.ch.k{animation-delay:-1.4s}
+@keyframes bob{50%{transform:translateY(-8px)}}
+.eyes{animation:blink 4.4s infinite;transform-box:fill-box;transform-origin:center}
+@keyframes blink{0%,94%,100%{transform:scaleY(1)}97%{transform:scaleY(.08)}}
+.pp{transition:transform .12s ease-out}
+.hand{opacity:0;transform:translateY(46px);transition:opacity .25s,transform .38s cubic-bezier(.3,1.5,.5,1)}
+.cover .hand{opacity:1;transform:translateY(0)}
+.shake .chars{animation:shk .55s}
+@keyframes shk{20%{transform:translateX(-12px)}40%{transform:translateX(12px)}60%{transform:translateX(-8px)}80%{transform:translateX(8px)}}
+.bubble{background:#fff;color:#1c1650;border:4px solid #1c1650;border-radius:18px;padding:10px 16px;margin:12px 0 4px;font-weight:800;font-size:16px;text-align:center;min-height:50px;
+ width:100%;max-width:420px;position:relative}
+.bubble:before{content:"";position:absolute;top:-14px;left:50%;margin-left:-12px;border:12px solid transparent;border-bottom-color:#1c1650;border-top:0}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style></head><body>
+<div class="stage" id="stage">
+ <span class="fl">📰</span><span class="fl">🏏</span><span class="fl">🚀</span><span class="fl">🌍</span>
+ <div class="chars">
+  <svg class="ch" viewBox="0 0 120 150" aria-label="Newsie the owl">
+   <ellipse cx="14" cy="92" rx="13" ry="32" fill="#6D3FD1"/><ellipse cx="106" cy="92" rx="13" ry="32" fill="#6D3FD1"/>
+   <ellipse cx="60" cy="88" rx="42" ry="48" fill="#8B5CF6"/><ellipse cx="60" cy="102" rx="27" ry="30" fill="#EDE4FF"/>
+   <path d="M24 52 L30 20 L50 40Z" fill="#6D3FD1"/><path d="M96 52 L90 20 L70 40Z" fill="#6D3FD1"/>
+   <g class="eyes"><circle cx="43" cy="63" r="19" fill="#fff" stroke="#1c1650" stroke-width="3"/><circle cx="77" cy="63" r="19" fill="#fff" stroke="#1c1650" stroke-width="3"/>
+    <g class="pp"><circle cx="45" cy="65" r="8" fill="#1c1650"/><circle cx="75" cy="65" r="8" fill="#1c1650"/><circle cx="48" cy="62" r="3" fill="#fff"/><circle cx="78" cy="62" r="3" fill="#fff"/></g></g>
+   <path d="M51 78 L69 78 L60 98Z" fill="#FFB020" stroke="#1c1650" stroke-width="2.5" stroke-linejoin="round"/>
+   <path d="M45 134 l-5 8 M52 134 l-2 9 M68 134 l2 9 M75 134 l5 8" stroke="#FFB020" stroke-width="4" stroke-linecap="round"/>
+   <rect x="30" y="2" width="60" height="14" rx="4" fill="#1c1650"/><rect x="54" y="-4" width="12" height="8" fill="#1c1650"/>
+   <ellipse class="hand" cx="43" cy="64" rx="23" ry="21" fill="#6D3FD1" stroke="#1c1650" stroke-width="3"/>
+   <ellipse class="hand" cx="77" cy="64" rx="23" ry="21" fill="#6D3FD1" stroke="#1c1650" stroke-width="3"/></svg>
+  <svg class="ch k" viewBox="0 0 120 150" aria-label="Kiki the tiger cub">
+   <ellipse cx="60" cy="118" rx="34" ry="28" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/><ellipse cx="60" cy="126" rx="20" ry="18" fill="#FFE3BF"/>
+   <circle cx="28" cy="38" r="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/><circle cx="92" cy="38" r="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/>
+   <circle cx="28" cy="38" r="7" fill="#FFB3C1"/><circle cx="92" cy="38" r="7" fill="#FFB3C1"/>
+   <circle cx="60" cy="68" r="44" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/>
+   <path d="M60 25 v14 M44 28 l4 12 M76 28 l-4 12 M18 62 h12 M18 76 h12 M102 62 h-12 M102 76 h-12" stroke="#1c1650" stroke-width="5" stroke-linecap="round"/>
+   <ellipse cx="60" cy="86" rx="22" ry="16" fill="#FFE3BF"/>
+   <g class="eyes"><circle cx="42" cy="62" r="11" fill="#fff" stroke="#1c1650" stroke-width="3"/><circle cx="78" cy="62" r="11" fill="#fff" stroke="#1c1650" stroke-width="3"/>
+    <g class="pp"><circle cx="44" cy="64" r="5.5" fill="#1c1650"/><circle cx="76" cy="64" r="5.5" fill="#1c1650"/><circle cx="46" cy="62" r="2" fill="#fff"/><circle cx="78" cy="62" r="2" fill="#fff"/></g></g>
+   <path d="M52 78 h16 l-8 8z" fill="#FF6B8A" stroke="#1c1650" stroke-width="2" stroke-linejoin="round"/>
+   <path d="M48 90 q12 14 24 0 z" fill="#8f1d2c" stroke="#1c1650" stroke-width="2.5" stroke-linejoin="round"/>
+   <ellipse class="hand" cx="42" cy="63" rx="16" ry="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/>
+   <ellipse class="hand" cx="78" cy="63" rx="16" ry="15" fill="#FF9F43" stroke="#1c1650" stroke-width="3"/></svg>
+ </div>
+ <div class="bubble" id="bub">Hi! 👋 Log in and we'll fetch today's news.</div>
+</div>
+<script>
+(function(){
+const stage=document.getElementById('stage'),bub=document.getElementById('bub');
+const pps=[...document.querySelectorAll('.pp')];
+let D=null;try{D=window.parent.document;void D.body;}catch(e){D=null;}
+const say=t=>{bub.textContent=t;};
+function look(cx,cy){
+ let fl=0,ft=0;try{const f=window.frameElement.getBoundingClientRect();fl=f.left;ft=f.top;}catch(e){}
+ pps.forEach(g=>{const r=g.ownerSVGElement.getBoundingClientRect();
+  const ex=fl+r.left+r.width/2,ey=ft+r.top+r.height*0.45,dx=cx-ex,dy=cy-ey,d=Math.hypot(dx,dy)||1,m=Math.min(1,d/160)*5;
+  g.style.transform='translate('+(dx/d*m)+'px,'+(dy/d*m)+'px)';});}
+function lookAt(t){const r=t.getBoundingClientRect();look(r.left+Math.min(r.width,30+(t.value||'').length*9),r.top+r.height/2);}
+const H={};
+H.mousemove=e=>look(e.clientX,e.clientY);
+H.focusin=e=>{const t=e.target;if(!t||!t.tagName)return;
+ if(t.tagName==='INPUT'&&t.type==='password'){stage.classList.add('cover');say("Shh... I'm not peeking! 🙈");}
+ else if(t.tagName==='INPUT'||t.tagName==='TEXTAREA'){stage.classList.remove('cover');say("I'm watching you type 👀");lookAt(t);}};
+H.focusout=e=>{setTimeout(()=>{const a=D.activeElement;if(!a||!(a.tagName==='INPUT'&&a.type==='password')){stage.classList.remove('cover');}},60);};
+H.input=e=>{const t=e.target;if(t&&t.tagName==='INPUT'&&t.type!=='password')lookAt(t);};
+let last='';
+const mo=D?new MutationObserver(()=>{const a=D.querySelector('[data-testid="stAlert"]');
+ const tx=a?a.innerText:'';if(tx&&tx!==last&&/wrong|too many|expired|not found|doesn't look|already/i.test(tx)){
+  last=tx;stage.classList.remove('cover');stage.classList.add('shake');say('Oops! Please check and try again 😅');setTimeout(()=>stage.classList.remove('shake'),700);}}):null;
+if(D){Object.keys(H).forEach(k=>D.addEventListener(k,H[k],true));mo.observe(D.body,{childList:true,subtree:true});}
+else{document.addEventListener('mousemove',H.mousemove);}
+window.addEventListener('pagehide',()=>{if(D){Object.keys(H).forEach(k=>D.removeEventListener(k,H[k],true));mo.disconnect();}});
+})();
+</script></body></html>"""
+
+
+def login_chars(height=430):
     try:
-        code = LANGS[st.session_state.lang][0]
-        if st.query_params.get("l") != code:
-            st.query_params["l"] = code
-        if st.query_params.get("z") != st.session_state.tsize:
-            st.query_params["z"] = st.session_state.tsize
+        components.html(LOGIN_CHARS_HTML, height=height)
     except Exception:
-        pass
+        embed_html(LOGIN_CHARS_HTML, height)
 
 
-WELCOME_PANELS = [
-    {"speaker": "Newsie", "emoji": "👋📰", "text": f"Hello friends! I'm Newsie the owl, and this is {APP_NAME}.",
-     "action": "wave", "motion": "zoom"},
-    {"speaker": "Kiki", "emoji": "🎨", "text": "I turn every news story into a fun cartoon, a quick quiz or a game!",
-     "action": "jump", "motion": "float"},
-    {"speaker": "Newsie", "emoji": "🌐", "text": "I speak many Indian languages too. Sign up free to collect XP and streak badges!",
-     "action": "cheer", "motion": "spin"},
-]
+def sidebar():
+    """Settings live here, always visible: profile, Kids Mode, language, text size, log out."""
+    u = st.session_state.get("user")
+    guest = st.session_state.get("guest")
+    with st.sidebar:
+        st.markdown(f'<div class="nv-side-brand">📰 <b>{esc(APP_NAME)}</b></div>', unsafe_allow_html=True)
+        if u:
+            row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))[0]
+            (lo, name, icon), nxt = level_of(row["xp"])
+            st.markdown(f"**Hi {esc(u['name'])}!** {icon} {name}")
+            if nxt:
+                st.progress(min(1.0, (row["xp"] - lo) / (nxt[0] - lo)), text=f"{row['xp']} / {nxt[0]} XP")
+            else:
+                st.caption(f"{row['xp']} XP · top level!")
+            st.caption(f"🔥 {row['streak']}-day streak")
+        elif guest:
+            st.caption("👤 Exploring as guest")
+        st.toggle("🧸 Kids Mode (safe stories, simple words)", key="kids")
+        st.selectbox("🌐 Translate summaries to", list(LANGS), key="lang")
+        st.selectbox("🔠 Text size", TEXT_SIZES, key="tsize")
+        try:
+            code = LANGS[st.session_state.lang][0]
+            if st.query_params.get("l") != code:
+                st.query_params["l"] = code
+            if st.query_params.get("z") != st.session_state.tsize:
+                st.query_params["z"] = st.session_state.tsize
+        except Exception:
+            pass
+        if u or guest:
+            if st.button("Log out" if u else "Exit guest mode", key="side_logout", width="stretch"):
+                do_logout()
+                st.rerun()
+        with st.expander("🔧 Check connections"):
+            st.caption("Shows which parts (news, translation, AI, voice) are working.")
+            if st.button("Run check", key="hc_btn"):
+                with st.spinner("Checking..."):
+                    st.session_state.hc = health_check()
+            for name, ok, detail in st.session_state.get("hc", []):
+                st.markdown(f"{ok} **{name}**  \n<small>{esc(detail)}</small>", unsafe_allow_html=True)
+        st.divider()
+        st.caption("Credibility and sentiment are quick hints, not facts. Always open the source.")
 
 
 def auth_screen():
-    st.markdown(features_html(), unsafe_allow_html=True)
-    left, right = st.columns([1, 1])
+    left, right = st.columns([1, 1.05], gap="large")
     with left:
-        embed_html(cartoon_html(WELCOME_PANELS, "en-IN", f"Welcome to {APP_NAME}"), 640)
+        login_chars(440)
     with right:
-        st.markdown(f"### Join {esc(APP_NAME)}")
+        st.markdown(f"### Welcome to {esc(APP_NAME)}")
         st.caption("Log in to save stories, earn XP and keep your streak. Guests get every feature too.")
         t1, t2, t3, t4 = st.tabs(["Log in", "Sign up", "Forgot password", "Explore"])
         with t1:
@@ -1910,12 +1972,9 @@ def auth_screen():
                     else:
                         st.error(res)
         with t3:
+            st.markdown("**Forgot your password? Two quick steps.**")
             if smtp_ready():
-                st.caption("Step 1: we email you a 6-digit code. Step 2: enter it with a new password.")
-            else:
-                st.caption(f"Step 1: ask the site owner at {contact_email()} for a reset code. "
-                           "Step 2: enter the code with a new password.")
-            if smtp_ready():
+                st.markdown("**Step 1.** Type your email and press the button. We email you a 6-digit code.")
                 with st.form("fp_req"):
                     fe = st.text_input("Your account email", key="fp_e")
                     if st.form_submit_button("Email me a reset code", width="stretch"):
@@ -1928,9 +1987,15 @@ def auth_screen():
                             st.success("If that email is registered, a code is on its way (valid 30 minutes). Check spam too.")
                         except Exception:
                             st.error("We couldn't send the email right now. Please contact the site owner.")
+            else:
+                st.markdown(
+                    f"**Step 1. Get your code.**\n\n"
+                    f"- **Site owner:** your code is the secret `OWNER_RESET_KEY` you saved in Streamlit Secrets.\n"
+                    f"- **Everyone else:** email **{esc(contact_email())}** and the owner will send you a 6-digit code.")
+            st.markdown("**Step 2.** Enter your email, the code and a new password.")
             with st.form("fp_set"):
                 e2 = st.text_input("Account email", key="fp_e2")
-                code2 = st.text_input("6-digit reset code", max_chars=6, key="fp_c")
+                code2 = st.text_input("Reset code", key="fp_c", max_chars=64)
                 np_ = st.text_input("New password (8+ characters, letters and numbers)", type="password", key="fp_p")
                 if st.form_submit_button("Set new password", type="primary", width="stretch"):
                     ok, msg = finish_reset(e2, code2, np_)
@@ -1945,34 +2010,9 @@ def auth_screen():
                 st.query_params["k"] = "1" if kid else "0"
                 log("guest_start")
                 st.rerun()
+    st.markdown(features_html(), unsafe_allow_html=True)
     with st.expander("🔒 Is my data safe? Where is it stored?"):
         st.markdown(privacy_md())
-
-
-def sidebar():
-    u = st.session_state.get("user")
-    with st.sidebar:
-        st.markdown(f"## 📰 {esc(APP_NAME)}")
-        if u:
-            row = q("SELECT xp,streak FROM users WHERE id=?", (u["id"],))[0]
-            (lo, name, icon), nxt = level_of(row["xp"])
-            st.markdown(f"**Hi {esc(u['name'])}!** {icon} {name}")
-            if nxt:
-                st.progress(min(1.0, (row["xp"] - lo) / (nxt[0] - lo)), text=f"{row['xp']} / {nxt[0]} XP")
-            else:
-                st.caption(f"{row['xp']} XP · top level!")
-            st.caption(f"🔥 {row['streak']}-day streak")
-        elif st.session_state.get("guest"):
-            st.caption("Exploring as guest")
-        with st.expander("🔧 Check connections"):
-            st.caption("Shows which parts (news, translation, AI, voice) are working.")
-            if st.button("Run check", key="hc_btn"):
-                with st.spinner("Checking..."):
-                    st.session_state.hc = health_check()
-            for name, ok, detail in st.session_state.get("hc", []):
-                st.markdown(f"{ok} **{name}**  \n<small>{esc(detail)}</small>", unsafe_allow_html=True)
-        st.divider()
-        st.caption("Credibility and sentiment are quick hints, not facts. Always open the source.")
 
 
 # ----------------------------------------------------------------------------
@@ -2122,20 +2162,17 @@ def studio(a):
 def page_news():
     kids = st.session_state.kids
     cats = KIDS_CATEGORIES if kids else list(CATEGORIES)
-    hero(190)
     st.markdown(features_html(), unsafe_allow_html=True)
     tick_ph = st.container()
     mission_card()
     topic = st.pills("⚡ Quick topics", list(TOPICS), key="topic_pill", label_visibility="collapsed")
     with st.form("news_form"):
-        c1, c2 = st.columns([5, 1.4], vertical_alignment="bottom")
-        query = c1.text_input("Search the news", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
-        go = c2.form_submit_button("🔎 Search", type="primary", width="stretch")
-        with st.expander("More filters"):
-            f1, f2, f3 = st.columns(3)
-            cat = f1.selectbox("Category", cats)
-            source = f2.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
-            n = f3.slider("Stories", 10, MAX_STORIES, 30)
+        query = st.text_input("Search a topic", placeholder="e.g. ISRO, Mysuru Dasara, cricket", max_chars=80)
+        f1, f2, f3 = st.columns(3)
+        cat = f1.selectbox("Category", cats)
+        source = f2.selectbox("News from", SOURCE_CHOICES + list(OUTLETS))
+        n = f3.slider("Stories", 10, MAX_STORIES, 30)
+        go = st.form_submit_button("🔎 Get news", type="primary", width="stretch")
     topic_changed = topic != st.session_state.get("last_topic")
     st.session_state.last_topic = topic
     first = "articles" not in st.session_state
@@ -2590,19 +2627,17 @@ def main():
         st.session_state.visit_logged = True
         log("visit")
     sidebar()
-    brand_bar()
-    top_bar()
     user, guest = st.session_state.get("user"), st.session_state.get("guest")
     tok = st.query_params.get("s")
     if user and tok and not st.session_state.get("ls_saved"):
         ls_helper("save", tok)
         st.session_state.ls_saved = True
+    hero(230)
     if not user and not guest:
         if st.session_state.pop("ls_clear", False):
             ls_helper("clear")
         elif not tok:
             ls_helper("restore")
-        hero(260)
         auth_screen()
         footer()
         return
