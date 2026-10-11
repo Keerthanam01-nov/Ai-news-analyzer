@@ -5,7 +5,7 @@ base = "light"
 primaryColor = "#5B3DF5"
 backgroundColor = "#F5F6FB"
 secondaryBackgroundColor = "#EEF0FF"
-textColor = "#16143A"
+textColor = "#d6d5e3"
 font = "sans serif"
 
 [client]
